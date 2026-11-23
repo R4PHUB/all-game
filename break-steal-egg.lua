@@ -2445,6 +2445,7 @@ local Farm = {
 	MaxTimePerEgg = 30, -- detik sebelum menyerah pada satu telur
 	ReturnWhenFull = true, -- setor hewan saat satchel penuh
 	BankMode = "Lewat Guard (Cepat)", -- "Lewat Guard (Cepat)" | "Jalan ke Base"
+	AutoBestZone = true, -- tanpa filter Zones: farm di zona tertinggi sesuai Speed
 }
 
 local Steal = {
@@ -3135,21 +3136,31 @@ local function ClickScreen()
 	end)
 end
 
+-- Kembalikan nama cara pukul yang dipakai (untuk log)
 local function HitEgg(Egg)
-	EquipPickaxe()
+	local Tool = EquipPickaxe()
 	FaceEgg(Egg)
+	if not Tool then
+		return "tanpa-pickaxe"
+	end
 
 	-- Utama: fungsi Swing milik game (cooldown, ID pukulan, remote diurus game)
 	if Farm.HitMode == "Swing Game (Aman)" then
 		local Controller = GameModule("PickaxeController")
-		if Controller and type(Controller.Swing) == "function" then
-			if pcall(Controller.Swing, Egg.Part) then
-				return
-			end
+		if not Controller or type(Controller.Swing) ~= "function" then
+			ClickScreen()
+			return "klik (modul gagal)"
 		end
+		local ok, Swung = pcall(Controller.Swing, Egg.Part)
+		if not ok then
+			ClickScreen()
+			return "klik (swing error)"
+		end
+		return Swung and "swing" or "swing-cooldown"
 	end
 
 	ClickScreen()
+	return "klik"
 end
 
 ---------------------------------------------------------------------
@@ -3347,8 +3358,32 @@ local function PlaceAllAnimals()
 	return Placed
 end
 
+-- Zona tertinggi yang Speed-mu sudah cukup (RequiredPower = "Recommended Speed" di game)
+local function BestZoneId()
+	local Power = tonumber(Player:GetAttribute("SpeedPower")) or 0
+	local Best = nil
+	if ZonesConfig and type(ZonesConfig.Zones) == "table" then
+		for _, Zone in ipairs(ZonesConfig.Zones) do
+			if type(Zone) == "table" and Zone.Id and (tonumber(Zone.RequiredPower) or 0) <= Power then
+				Best = Zone.Id
+			end
+		end
+	end
+	return Best or "Zone1"
+end
+
+local TooStrong = {} -- nama telur -> os.clock() sampai kapan dilewati
+local CurrentBestZone = nil
+
 local function FarmFilter(Egg)
-	if #Farm.Zones > 0 and not table.find(Farm.Zones, ZoneName(Egg.ZoneId)) then
+	if #Farm.Zones > 0 then
+		if not table.find(Farm.Zones, ZoneName(Egg.ZoneId)) then
+			return false
+		end
+	elseif Farm.AutoBestZone and CurrentBestZone and Egg.ZoneId ~= CurrentBestZone then
+		return false
+	end
+	if TooStrong[Egg.Name] and os.clock() < TooStrong[Egg.Name] then
 		return false
 	end
 	if #Farm.Names > 0 and not table.find(Farm.Names, Egg.Name) then
@@ -3375,6 +3410,7 @@ local function FarmScore(Egg)
 end
 
 local function PickFarmEgg(Skip)
+	CurrentBestZone = BestZoneId()
 	local Best, BestRank, BestScore = nil, nil, nil
 	for _, Egg in ipairs(CollectEggs()) do
 		if FarmFilter(Egg) and not Skip[Egg.Model] then
@@ -3410,10 +3446,21 @@ local FarmStatus = FarmSection:AddParagraph({
 	Content = "Mati",
 })
 
+-- Log farm (disimpan otomatis ke RapHub/FarmLog.txt saat farm/steal aktif)
+local FarmLogLines = {}
+local function FarmLog(Text)
+	local Line = string.format("[%s] %s", os.date("%H:%M:%S"), Text)
+	table.insert(FarmLogLines, Line)
+	if #FarmLogLines > 500 then
+		table.remove(FarmLogLines, 1)
+	end
+end
+
 local LastStatus = ""
 local function SetStatus(Text)
 	if Text ~= LastStatus then
 		LastStatus = Text
+		FarmLog(Text)
 		task.spawn(function()
 			pcall(function()
 				FarmStatus:Set({ Title = "Status", Content = Text })
@@ -3486,6 +3533,15 @@ FarmSection:AddToggle({
 	Default = true,
 	Callback = function(Value)
 		Farm.TitanicFirst = Value
+	end,
+})
+
+FarmSection:AddToggle({
+	Title = "Auto Zona Terbaik",
+	Content = "Kalau Zones kosong: farm di zona tertinggi yang Speed-mu sudah cukup (Recommended Speed)",
+	Default = true,
+	Callback = function(Value)
+		Farm.AutoBestZone = Value
 	end,
 })
 
@@ -4561,6 +4617,8 @@ end)
 -- Auto farm: satu langkah per panggilan, dibungkus pcall supaya error terlihat
 local LastFarmError = nil
 local FarmSkip = setmetatable({}, { __mode = "k" })
+local NoDamageStreak = 0
+local LogDiagnostics -- diisi setelah DiagnoseText ada
 
 local function FarmStep()
 	if IsJailed() then
@@ -4623,8 +4681,13 @@ local function FarmStep()
 	end
 
 	local Started, Retries = os.clock(), 0
+	local StartHP = tonumber(Egg.Part:GetAttribute("Health"))
+	local CheckAt = os.clock() + 4
+	local Methods = {}
+
 	while Farm.Enabled and not Library.Unloaded and EggAlive(Egg) and not IsJailed() do
 		if os.clock() - Started > Farm.MaxTimePerEgg then
+			FarmLog("Waktu habis untuk " .. Label)
 			FarmSkip[Egg.Model] = true
 			break
 		end
@@ -4633,20 +4696,94 @@ local function FarmStep()
 		if Distance(Egg) > 12 then
 			Retries += 1
 			if Retries > 3 or not TeleportToEgg(Egg) then
+				FarmLog("Terpental terus dari " .. Label .. ", pindah telur")
 				FarmSkip[Egg.Model] = true
 				break
 			end
 		end
 
 		SetStatus(string.format("Memukul %s | bawa %d/%d", Label, CarryCount(), SatchelCapacity()))
-		HitEgg(Egg)
+		local Method = HitEgg(Egg)
+		Methods[Method] = (Methods[Method] or 0) + 1
+
+		-- Setelah 4 detik: cek apakah HP telur turun & bisa pecah tepat waktu
+		if StartHP and os.clock() >= CheckAt then
+			CheckAt = math.huge
+			local NowHP = tonumber(Egg.Part:GetAttribute("Health")) or StartHP
+			local Elapsed = math.max(os.clock() - Started, 0.1)
+			local MethodParts = {}
+			for Name, Count in pairs(Methods) do
+				table.insert(MethodParts, Name .. " x" .. Count)
+			end
+			local MethodText = table.concat(MethodParts, ", ")
+
+			if NowHP >= StartHP then
+				NoDamageStreak += 1
+				FarmLog(string.format(
+					"HP %s TIDAK TURUN (%.0f) setelah %.0f dtk | cara: %s | jarak %.1f | streak %d",
+					Label,
+					NowHP,
+					Elapsed,
+					MethodText,
+					Distance(Egg),
+					NoDamageStreak
+				))
+				-- 2x berturut-turut tidak masuk -> ganti cara pukul otomatis
+				if NoDamageStreak >= 2 then
+					NoDamageStreak = 0
+					Farm.HitMode = Farm.HitMode == "Swing Game (Aman)" and "Klik Virtual" or "Swing Game (Aman)"
+					FarmLog("Ganti Cara Pukul ke: " .. Farm.HitMode)
+					Notify("Auto Farm", "Pukulan tidak masuk, ganti cara pukul ke " .. Farm.HitMode)
+				end
+				FarmSkip[Egg.Model] = true
+				break
+			end
+
+			NoDamageStreak = 0
+			local Rate = (StartHP - NowHP) / Elapsed
+			local Eta = NowHP / Rate
+			FarmLog(string.format("%s: HP turun %.3g/dtk, pecah sekitar %.0f dtk lagi | cara: %s", Label, Rate, Eta, MethodText))
+			if Eta > Farm.MaxTimePerEgg then
+				TooStrong[Egg.Name] = os.clock() + 120
+				FarmLog(Label .. " terlalu kuat untuk batas waktu, jenis ini dilewati 2 menit")
+				FarmSkip[Egg.Model] = true
+				break
+			end
+		end
+
 		task.wait(Farm.HitDelay)
+	end
+
+	if not EggAlive(Egg) then
+		FarmLog("Telur pecah: " .. Label .. " | bawa " .. CarryCount() .. "/" .. SatchelCapacity())
 	end
 end
 
+-- Simpan log farm ke file tiap 10 detik saat aktif
 task.spawn(function()
+	pcall(function()
+		if makefolder and not (isfolder and isfolder("RapHub")) then
+			makefolder("RapHub")
+		end
+	end)
 	while not Library.Unloaded do
-		if not Working() then
+		task.wait(10)
+		if Working() and writefile and #FarmLogLines > 0 then
+			pcall(writefile, "RapHub/FarmLog.txt", table.concat(FarmLogLines, "\n"))
+		end
+	end
+end)
+
+task.spawn(function()
+	local WasWorking = false
+	while not Library.Unloaded do
+		local Active = Working()
+		if Active and not WasWorking and LogDiagnostics then
+			pcall(LogDiagnostics)
+		end
+		WasWorking = Active
+
+		if not Active then
 			task.wait(0.3)
 		else
 			local ok, Err = pcall(FarmStep)
@@ -4689,6 +4826,20 @@ local function DiagnoseText()
 	table.insert(Parts, "Curi terakhir: " .. LastStealResult)
 	table.insert(Parts, "StreamingEnabled: " .. tostring(workspace.StreamingEnabled))
 	return table.concat(Parts, " | ")
+end
+
+LogDiagnostics = function()
+	FarmLog("=== MULAI === " .. DiagnoseText())
+	FarmLog(string.format(
+		"Setelan: mode gerak %s | cara pukul %s | setor %s | zona %s | auto zona terbaik %s (%s) | speed %s",
+		Settings.TeleportMode,
+		Farm.HitMode,
+		Farm.BankMode,
+		#Farm.Zones > 0 and table.concat(Farm.Zones, ",") or "semua",
+		tostring(Farm.AutoBestZone),
+		ZoneName(BestZoneId()),
+		tostring(Player:GetAttribute("SpeedPower"))
+	))
 end
 
 DiagSection:AddButton({
