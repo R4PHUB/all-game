@@ -2438,7 +2438,7 @@ local Farm = {
 	MinWeight = 0, -- kg
 	Priority = "Terdekat", -- "Terdekat" | "Luck Tertinggi" | "Terberat" | "HP Terendah"
 	TitanicFirst = true,
-	HitMode = "Tool (Aman)", -- "Tool (Aman)" | "Remote (Cepat)"
+	HitMode = "Swing Game (Aman)", -- "Swing Game (Aman)" | "Klik Virtual"
 	HitDelay = 0.15, -- detik antar pukulan
 	MaxTimePerEgg = 30, -- detik sebelum menyerah pada satu telur
 	ReturnWhenFull = true, -- pulang ke base saat satchel penuh
@@ -2536,13 +2536,6 @@ local function ParseShort(Text)
 	return (tonumber(Num) or 0) * (SUFFIX[Suffix] or 1)
 end
 
--- Remote game
-local Remotes = {
-	EggHitRequest = ReplicatedStorage:FindFirstChild("EggHitRequest"),
-	EggHitConfirmed = ReplicatedStorage:FindFirstChild("EggHitConfirmed"),
-	EggHitRejected = ReplicatedStorage:FindFirstChild("EggHitRejected"),
-	AnimalBanked = ReplicatedStorage:FindFirstChild("AnimalBankedRemote"),
-}
 
 ---------------------------------------------------------------------
 -- Karakter & teleport
@@ -2917,6 +2910,30 @@ local function GoToBase()
 end
 
 ---------------------------------------------------------------------
+-- Modul client game (aksi lewat jalur resmi game = aman & akurat)
+---------------------------------------------------------------------
+local ModuleCache = {}
+
+local function GameModule(Name)
+	if ModuleCache[Name] then
+		return ModuleCache[Name]
+	end
+	local Scripts = Player:FindFirstChild("PlayerScripts")
+	local Client = Scripts and Scripts:FindFirstChild("Client")
+	local Controllers = Client and Client:FindFirstChild("Controllers")
+	local Module = Controllers and Controllers:FindFirstChild(Name)
+	if not Module or not Module:IsA("ModuleScript") then
+		return nil
+	end
+	local ok, Result = pcall(require, Module)
+	if ok and type(Result) == "table" then
+		ModuleCache[Name] = Result
+		return Result
+	end
+	return nil
+end
+
+---------------------------------------------------------------------
 -- Pukul telur
 ---------------------------------------------------------------------
 local function GetPickaxe()
@@ -2940,20 +2957,6 @@ local function EquipPickaxe()
 	return Tool
 end
 
--- Nomor hit terakhir dari server (dipakai mode Remote)
-local HitSeq = 0
-local function TrackSeq(_, Seq)
-	if type(Seq) == "number" and Seq > HitSeq then
-		HitSeq = Seq
-	end
-end
-if Remotes.EggHitConfirmed then
-	Remotes.EggHitConfirmed.OnClientEvent:Connect(TrackSeq)
-end
-if Remotes.EggHitRejected then
-	Remotes.EggHitRejected.OnClientEvent:Connect(TrackSeq)
-end
-
 local function FaceEgg(Egg)
 	local Root = GetRoot()
 	if Root then
@@ -2962,31 +2965,225 @@ local function FaceEgg(Egg)
 	end
 end
 
+-- Cadangan: klik kiri virtual di tengah layar (game memukul lewat klik mouse)
+local function ClickScreen()
+	pcall(function()
+		local VirtualInputManager = game:GetService("VirtualInputManager")
+		local Size = workspace.CurrentCamera.ViewportSize
+		VirtualInputManager:SendMouseButtonEvent(Size.X / 2, Size.Y * 0.6, 0, true, game, 0)
+		VirtualInputManager:SendMouseButtonEvent(Size.X / 2, Size.Y * 0.6, 0, false, game, 0)
+	end)
+end
+
 local function HitEgg(Egg)
-	local Tool = EquipPickaxe()
+	EquipPickaxe()
 	FaceEgg(Egg)
 
-	if Farm.HitMode == "Remote (Cepat)" and Remotes.EggHitRequest and HitSeq > 0 then
-		HitSeq += 1
-		Remotes.EggHitRequest:FireServer(Egg.Part, HitSeq)
-	elseif Tool then
-		Tool:Activate()
+	-- Utama: fungsi Swing milik game (cooldown, ID pukulan, remote diurus game)
+	if Farm.HitMode == "Swing Game (Aman)" then
+		local Controller = GameModule("PickaxeController")
+		if Controller and type(Controller.Swing) == "function" then
+			if pcall(Controller.Swing, Egg.Part) then
+				return
+			end
+		end
 	end
+
+	ClickScreen()
 end
 
 ---------------------------------------------------------------------
--- Auto farm
+-- Hewan yang dibawa (atribut asli game)
 ---------------------------------------------------------------------
-local Carried = 0 -- perkiraan jumlah hewan yang sedang dibawa
-
-if Remotes.AnimalBanked then
-	Remotes.AnimalBanked.OnClientEvent:Connect(function()
-		Carried = 0
-	end)
+local function CarryCount()
+	local Count = tonumber(Player:GetAttribute("CarryCount"))
+	if Count then
+		return Count
+	end
+	return Player:GetAttribute("Carrying") ~= nil and 1 or 0
 end
 
 local function SatchelCapacity()
 	return tonumber(Player:GetAttribute("SatchelCapacity")) or 1
+end
+
+local function IsJailed()
+	return Player:GetAttribute("Jailed") == true or Player:GetAttribute("CarryingJail") == true
+end
+
+---------------------------------------------------------------------
+-- Taruh hewan di base sendiri (posisi dihitung dari Hitbox base masing-masing)
+---------------------------------------------------------------------
+local CollectionService = game:GetService("CollectionService")
+
+local Place = {
+	Auto = false,
+	Rarities = {}, -- kosong = semua
+}
+
+local function AnimalTools()
+	local List = {}
+	for _, Container in ipairs({ Player.Character, Player:FindFirstChild("Backpack") }) do
+		if Container then
+			for _, Tool in ipairs(Container:GetChildren()) do
+				if
+					Tool:IsA("Tool")
+					and (CollectionService:HasTag(Tool, "AnimalTool") or Tool:GetAttribute("AnimalName") ~= nil)
+				then
+					table.insert(List, Tool)
+				end
+			end
+		end
+	end
+	return List
+end
+
+local function PlotUsage(Plot)
+	return tonumber(Plot:GetAttribute("AnimalsPlaced")) or 0, tonumber(Plot:GetAttribute("MaxAnimals")) or 0
+end
+
+-- Titik kosong di lantai base (grid di dalam Hitbox, jauh dari hewan yang sudah ada)
+local function FreeSpots(Plot)
+	local Hitbox = Plot:FindFirstChild("Hitbox")
+	if not Hitbox or not Hitbox:IsA("BasePart") then
+		return {}
+	end
+
+	local PlacedFolder = Plot:FindFirstChild("PlacedAnimals")
+	local Taken = {}
+	if PlacedFolder then
+		for _, Animal in ipairs(PlacedFolder:GetChildren()) do
+			local ok, Pos = pcall(function()
+				return Animal:GetPivot().Position
+			end)
+			if ok then
+				table.insert(Taken, { Pos = Pos, Span = tonumber(Animal:GetAttribute("PlacedHalfSpan")) or 4 })
+			end
+		end
+	end
+
+	local Ignore = { Hitbox }
+	if PlacedFolder then
+		table.insert(Ignore, PlacedFolder)
+	end
+	for _, Other in ipairs(Players:GetPlayers()) do
+		if Other.Character then
+			table.insert(Ignore, Other.Character)
+		end
+	end
+
+	local Params = RaycastParams.new()
+	Params.FilterType = Enum.RaycastFilterType.Exclude
+	Params.FilterDescendantsInstances = Ignore
+
+	local Size = Hitbox.Size
+	local Spots = {}
+	for X = -Size.X / 2 + 4, Size.X / 2 - 4, 5 do
+		for Z = -Size.Z / 2 + 4, Size.Z / 2 - 4, 5 do
+			local From = Hitbox.CFrame:PointToWorldSpace(Vector3.new(X, -Size.Y / 2 + 6, Z))
+			local Hit = workspace:Raycast(From, Vector3.new(0, -12, 0), Params)
+			if Hit then
+				local Free = true
+				for _, Item in ipairs(Taken) do
+					local Gap = Vector3.new(Hit.Position.X - Item.Pos.X, 0, Hit.Position.Z - Item.Pos.Z).Magnitude
+					if Gap < Item.Span + 3 then
+						Free = false
+						break
+					end
+				end
+				if Free then
+					table.insert(Spots, Hit.Position)
+				end
+			end
+		end
+	end
+
+	local Center = Hitbox.Position
+	table.sort(Spots, function(a, b)
+		return (a - Center).Magnitude < (b - Center).Magnitude
+	end)
+	return Spots
+end
+
+local PlaceSeq = 0
+local function PlaceToolAt(Tool, Spot)
+	local Controller = GameModule("AnimalToolController")
+	if Controller and type(Controller.PlaceAt) == "function" then
+		if pcall(Controller.PlaceAt, Tool, Spot) then
+			return
+		end
+	end
+	local Remote = ReplicatedStorage:FindFirstChild("PlaceAnimalRemote")
+	if Remote then
+		PlaceSeq += 1
+		Remote:FireServer(Tool, Spot, PlaceSeq)
+	end
+end
+
+local PlaceBusy = false
+
+-- Taruh semua hewan di Backpack (sesuai filter). Harus sudah berada di base.
+local function PlaceAllAnimals()
+	if PlaceBusy then
+		return 0
+	end
+	PlaceBusy = true
+
+	local Placed = 0
+	local Plot = MyPlot()
+	local Humanoid = GetHumanoid()
+	local Controller = GameModule("AnimalToolController")
+
+	if Plot and Humanoid then
+		for _, Tool in ipairs(AnimalTools()) do
+			local Rarity = Tool:GetAttribute("Rarity")
+			if #Place.Rarities > 0 and not table.find(Place.Rarities, Rarity) then
+				continue
+			end
+
+			local Used, Max = PlotUsage(Plot)
+			if Max > 0 and Used >= Max then
+				Notify("Base", string.format("Base penuh (%d/%d)", Used, Max))
+				break
+			end
+
+			Humanoid:EquipTool(Tool)
+			task.wait(0.3)
+
+			local Tries = 0
+			for _, Spot in ipairs(FreeSpots(Plot)) do
+				if not Tool.Parent then
+					break
+				end
+				local Allowed = true
+				if Controller and type(Controller.CanPlaceAt) == "function" then
+					local ok, Result = pcall(Controller.CanPlaceAt, Spot)
+					Allowed = not ok or Result == true
+				end
+				if Allowed then
+					Tries += 1
+					PlaceToolAt(Tool, Spot)
+
+					-- Berhasil = tool hilang dari karakter/backpack
+					local Started = os.clock()
+					while Tool.Parent and os.clock() - Started < 2.5 do
+						task.wait(0.1)
+					end
+					if not Tool.Parent then
+						Placed += 1
+						break
+					end
+					if Tries >= 4 then
+						break
+					end
+				end
+			end
+			task.wait(0.2)
+		end
+	end
+
+	PlaceBusy = false
+	return Placed
 end
 
 local function FarmFilter(Egg)
@@ -3144,12 +3341,12 @@ FarmSection:AddDropdown({
 
 FarmSection:AddDropdown({
 	Title = "Cara Pukul",
-	Content = "Tool = lewat pickaxe, Remote = kirim hit langsung",
+	Content = "Swing Game = pakai fungsi pickaxe game. Klik Virtual = cadangan",
 	Multi = false,
-	Options = { "Tool (Aman)", "Remote (Cepat)" },
-	Default = { "Tool (Aman)" },
+	Options = { "Swing Game (Aman)", "Klik Virtual" },
+	Default = { "Swing Game (Aman)" },
 	Callback = function(Value)
-		Farm.HitMode = Value and Value[1] or "Tool (Aman)"
+		Farm.HitMode = Value and Value[1] or "Swing Game (Aman)"
 	end,
 })
 
@@ -3180,6 +3377,65 @@ FarmSection:AddButton({
 	Content = "Ambil ulang nama telur di map",
 	Callback = function()
 		FarmNameDropdown:Refresh(AllEggNames(), Farm.Names)
+	end,
+})
+
+-- ===================== Main: Taruh Hewan =====================
+local AnimalSection = MainTab:AddSection("Taruh Hewan di Base", false)
+
+local BaseInfo = AnimalSection:AddParagraph({
+	Title = "Base",
+	Content = "Menghitung...",
+})
+
+local function AnimalRarityOptions()
+	local Seen, List = {}, {}
+	for _, Rarity in ipairs(RARITY_ORDER) do
+		Seen[Rarity] = true
+		table.insert(List, Rarity)
+	end
+	for _, Tool in ipairs(AnimalTools()) do
+		local Rarity = Tool:GetAttribute("Rarity")
+		if type(Rarity) == "string" and not Seen[Rarity] then
+			Seen[Rarity] = true
+			table.insert(List, Rarity)
+		end
+	end
+	return List
+end
+
+AnimalSection:AddDropdown({
+	Title = "Animal Rarities (kosong = semua)",
+	Content = "Hanya taruh hewan rarity ini",
+	Multi = true,
+	Options = AnimalRarityOptions(),
+	Default = {},
+	Callback = function(Value)
+		Place.Rarities = Value or {}
+	end,
+})
+
+AnimalSection:AddToggle({
+	Title = "Auto Taruh Hewan",
+	Content = "Taruh hewan otomatis setiap pulang ke base",
+	Default = false,
+	Callback = function(Value)
+		Place.Auto = Value
+	end,
+})
+
+AnimalSection:AddButton({
+	Title = "Taruh Semua Sekarang",
+	Content = "Pulang ke base lalu taruh semua hewan di Backpack",
+	Callback = function()
+		if #AnimalTools() == 0 then
+			Notify("Base", "Tidak ada hewan di Backpack.")
+			return
+		end
+		if GoToBase() then
+			local Count = PlaceAllAnimals()
+			Notify("Base", Count .. " hewan ditaruh.")
+		end
 	end,
 })
 
@@ -3443,6 +3699,44 @@ task.spawn(function()
 	end
 end)
 
+-- Info base (jumlah hewan ditaruh / kapasitas / di Backpack)
+task.spawn(function()
+	local Last = ""
+	while not Library.Unloaded do
+		local Plot = MyPlot()
+		local Text = "Base tidak ditemukan"
+		if Plot then
+			local Used, Max = PlotUsage(Plot)
+			Text = string.format("Ditaruh: %d/%d | Di Backpack: %d hewan", Used, Max, #AnimalTools())
+		end
+		if Text ~= Last then
+			Last = Text
+			pcall(function()
+				BaseInfo:Set({ Title = "Base", Content = Text })
+			end)
+		end
+		task.wait(2)
+	end
+end)
+
+-- Pulang ke base, tunggu hewan tersimpan, lalu (opsional) taruh hewan
+local function BankAndPlace()
+	SetStatus(string.format("Pulang ke base (bawa %d/%d)", CarryCount(), SatchelCapacity()))
+	if not GoToBase() then
+		return
+	end
+
+	local Started = os.clock()
+	while Farm.Enabled and CarryCount() > 0 and os.clock() - Started < 6 do
+		task.wait(0.2)
+	end
+
+	if Place.Auto and Farm.Enabled and #AnimalTools() > 0 then
+		SetStatus("Menaruh hewan di base...")
+		PlaceAllAnimals()
+	end
+end
+
 -- Auto farm
 task.spawn(function()
 	local Skip = setmetatable({}, { __mode = "k" })
@@ -3453,21 +3747,25 @@ task.spawn(function()
 			continue
 		end
 
+		if IsJailed() then
+			SetStatus("Sedang ditahan, menunggu...")
+			task.wait(1)
+			continue
+		end
+
 		-- Satchel penuh -> pulang ke base supaya hewan tersimpan
-		if Farm.ReturnWhenFull and Carried >= SatchelCapacity() then
-			SetStatus(string.format("Pulang ke base (bawa %d hewan)", Carried))
-			if GoToBase() then
-				local Started = os.clock()
-				while Farm.Enabled and Carried > 0 and os.clock() - Started < 5 do
-					task.wait(0.2)
-				end
-			end
-			Carried = 0
+		if Farm.ReturnWhenFull and CarryCount() >= SatchelCapacity() then
+			BankAndPlace()
 			continue
 		end
 
 		local Egg = PickFarmEgg(Skip)
 		if not Egg then
+			-- Tidak ada telur cocok: setor dulu hewan yang sedang dibawa
+			if Farm.ReturnWhenFull and CarryCount() > 0 then
+				BankAndPlace()
+				continue
+			end
 			SetStatus("Menunggu telur yang cocok...")
 			table.clear(Skip)
 			task.wait(1)
@@ -3481,8 +3779,8 @@ task.spawn(function()
 			TeleportToEgg(Egg)
 		end
 
-		local Started, Hits = os.clock(), 0
-		while Farm.Enabled and not Library.Unloaded and EggAlive(Egg) do
+		local Started = os.clock()
+		while Farm.Enabled and not Library.Unloaded and EggAlive(Egg) and not IsJailed() do
 			if os.clock() - Started > Farm.MaxTimePerEgg then
 				Skip[Egg.Model] = true
 				break
@@ -3494,15 +3792,9 @@ task.spawn(function()
 				TeleportToEgg(Egg)
 			end
 
-			SetStatus(string.format("Memukul %s | bawa %d/%d", Label, Carried, SatchelCapacity()))
+			SetStatus(string.format("Memukul %s | bawa %d/%d", Label, CarryCount(), SatchelCapacity()))
 			HitEgg(Egg)
-			Hits += 1
 			task.wait(Farm.HitDelay)
-		end
-
-		-- Telur pecah saat kita memukul -> hewan ikut dibawa
-		if Farm.Enabled and Hits > 0 and not EggAlive(Egg) then
-			Carried += 1
 		end
 	end
 end)
