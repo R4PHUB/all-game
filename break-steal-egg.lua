@@ -2830,7 +2830,11 @@ local function StandAt(Pos, LookAt)
 	local Ground = GroundAt(Pos.X, Pos.Z, Pos.Y + 25)
 	local Stand = Ground + Vector3.new(0, 3.5, 0)
 	if LookAt then
-		return CFrame.lookAt(Stand, Vector3.new(LookAt.X, Stand.Y, LookAt.Z))
+		local Face = Vector3.new(LookAt.X, Stand.Y, LookAt.Z)
+		-- Titik hadap sama dengan titik berdiri -> CFrame NaN (merusak karakter)
+		if (Face - Stand).Magnitude > 0.1 then
+			return CFrame.lookAt(Stand, Face)
+		end
 	end
 	return CFrame.new(Stand)
 end
@@ -4264,7 +4268,7 @@ end
 local function ParseObjectText(Text)
 	local Plain = Text:gsub("<[^>]->", "")
 	local WeightText = Plain:match("%[([^%]]+)%]")
-	local Weight = WeightText and ParseShort((WeightText:gsub("[Kk][Gg]", ""))) or nil
+	local Weight = WeightText and ParseShort((WeightText:gsub("[Kk][Gg]", ""):gsub(",", ""))) or nil
 	local Name = Plain:gsub("%b[]", ""):gsub("^%s+", ""):gsub("%s+$", "")
 
 	local Lookup = GetAnimalRarity()
@@ -4366,6 +4370,26 @@ local function ZoneIdAt(Pos)
 	return nil
 end
 
+-- Base (plot) tempat sebuah posisi berada, dicek dari Hitbox tiap plot
+-- (prompt hewan di base ada di Workspace.PromptAnchor, bukan di folder Plots)
+local function PlotAt(Pos)
+	local Plots = workspace:FindFirstChild("Plots")
+	if not Plots then
+		return nil
+	end
+	for _, Plot in ipairs(Plots:GetChildren()) do
+		local Hitbox = Plot:FindFirstChild("Hitbox")
+		if Hitbox and Hitbox:IsA("BasePart") then
+			local Rel = Hitbox.CFrame:PointToObjectSpace(Pos)
+			local Half = Hitbox.Size / 2 + Vector3.new(4, 10, 4)
+			if math.abs(Rel.X) <= Half.X and math.abs(Rel.Y) <= Half.Y and math.abs(Rel.Z) <= Half.Z then
+				return Plot
+			end
+		end
+	end
+	return nil
+end
+
 local function StealTargets()
 	local List = {}
 	local Root = GetRoot()
@@ -4373,10 +4397,12 @@ local function StealTargets()
 	local Plots = workspace:FindFirstChild("Plots")
 
 	for _, Prompt in ipairs(AllStealPrompts()) do
-		if Prompt:IsDescendantOf(workspace) and not StealSkip[Prompt] and not (Plot and Prompt:IsDescendantOf(Plot)) then
-			local InBase = Plots ~= nil and Prompt:IsDescendantOf(Plots)
+		local Pos = Prompt.Enabled and PromptPosition(Prompt) or nil
+		local PlotHere = Pos and PlotAt(Pos) or nil
+		local Mine = Plot ~= nil and (PlotHere == Plot or Prompt:IsDescendantOf(Plot))
+		if Pos and Prompt:IsDescendantOf(workspace) and not StealSkip[Prompt] and not Mine then
+			local InBase = PlotHere ~= nil or (Plots ~= nil and Prompt:IsDescendantOf(Plots))
 			if (InBase and Steal.OtherBases) or (not InBase and Steal.Dropped) then
-				local Pos = PromptPosition(Prompt)
 				local ZoneOk = true
 				if Pos and #Steal.Zones > 0 then
 					local ZoneId = ZoneIdAt(Pos)
@@ -4414,7 +4440,7 @@ local function StealOne(Info)
 	local Anchor = Info.Prompt.Parent
 	local Target = (Anchor and Anchor:IsA("BasePart")) and Anchor.Position or Info.Position
 	if Info.Distance > 5 then
-		if not TeleportTo(StandAt(Target, Target)) then
+		if not TeleportTo(StandAt(Target)) then
 			StealSkip[Info.Prompt] = true
 			LastStealResult = "Gagal sampai ke " .. Label .. " (" .. tostring(LastMoveProblem or "?") .. ")"
 			return false
