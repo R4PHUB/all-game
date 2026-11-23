@@ -2408,8 +2408,8 @@ end)()
 
 --[[
 	RapHub - Break and Steal an Egg
-	  - Teleport ke telur (daftar telur yang muncul, terdekat, auto + filter)
-	  - Teleport ke zona (nama asli zona) & lokasi penting (base, mesin)
+	  - Auto Farm Eggs: datangi telur, pukul sampai pecah, pulang ke base saat satchel penuh
+	  - Teleport ke telur / zona / lokasi penting
 	`Library` (UI) ditanam otomatis di atas file ini oleh build.js
 ]]
 
@@ -2428,10 +2428,20 @@ local Settings = {
 	WalkMultiplier = 1, -- pengali WalkSpeed untuk mode Jalan (Aman)
 	TweenSpeed = 300, -- stud per detik
 	ZoneTarget = "Pintu Masuk", -- "Pintu Masuk" | "Tengah Zona" | "Area Telur"
-	AutoPriority = "Terdekat", -- "Terdekat" | "Luck Tertinggi" | "Terberat"
-	AutoNames = {}, -- kosong = semua telur
-	AutoRarities = {}, -- kosong = semua rarity
-	AutoStayTime = 10, -- detik maksimal di satu telur
+}
+
+local Farm = {
+	Enabled = false,
+	Zones = {}, -- nama zona, kosong = semua
+	Names = {}, -- nama telur, kosong = semua
+	Rarities = {}, -- rarity telur, kosong = semua
+	MinWeight = 0, -- kg
+	Priority = "Terdekat", -- "Terdekat" | "Luck Tertinggi" | "Terberat" | "HP Terendah"
+	TitanicFirst = true,
+	HitMode = "Tool (Aman)", -- "Tool (Aman)" | "Remote (Cepat)"
+	HitDelay = 0.15, -- detik antar pukulan
+	MaxTimePerEgg = 30, -- detik sebelum menyerah pada satu telur
+	ReturnWhenFull = true, -- pulang ke base saat satchel penuh
 }
 
 ---------------------------------------------------------------------
@@ -2486,7 +2496,6 @@ local Shared = ReplicatedStorage:FindFirstChild("Shared")
 local ZoneDisplayInfo = SafeRequire(Shared, "ZoneDisplayInfo")
 local ZonesConfig = SafeRequire(Shared, "ZonesConfig")
 
--- Ambil nama zona dari game kalau bisa
 if ZoneDisplayInfo then
 	for ZoneId, Info in pairs(ZoneDisplayInfo) do
 		if type(Info) == "table" and type(Info.Name) == "string" then
@@ -2495,7 +2504,6 @@ if ZoneDisplayInfo then
 	end
 end
 
--- Urutan rarity dari ZonesConfig (kalau ada)
 if ZonesConfig and type(ZonesConfig.Zones) == "table" then
 	local List = {}
 	for _, Zone in ipairs(ZonesConfig.Zones) do
@@ -2528,12 +2536,25 @@ local function ParseShort(Text)
 	return (tonumber(Num) or 0) * (SUFFIX[Suffix] or 1)
 end
 
+-- Remote game
+local Remotes = {
+	EggHitRequest = ReplicatedStorage:FindFirstChild("EggHitRequest"),
+	EggHitConfirmed = ReplicatedStorage:FindFirstChild("EggHitConfirmed"),
+	EggHitRejected = ReplicatedStorage:FindFirstChild("EggHitRejected"),
+	AnimalBanked = ReplicatedStorage:FindFirstChild("AnimalBankedRemote"),
+}
+
 ---------------------------------------------------------------------
 -- Karakter & teleport
 ---------------------------------------------------------------------
 local function GetRoot()
 	local Character = Player.Character
 	return Character and Character:FindFirstChild("HumanoidRootPart")
+end
+
+local function GetHumanoid()
+	local Character = Player.Character
+	return Character and Character:FindFirstChildOfClass("Humanoid")
 end
 
 local function GetBuild()
@@ -2554,21 +2575,14 @@ local function GroundAt(X, Z, FromY)
 	end
 	Params.FilterDescendantsInstances = Ignore
 
-	local Origin = Vector3.new(X, FromY or 40, Z)
-	local Result = workspace:Raycast(Origin, Vector3.new(0, -200, 0), Params)
+	local Result = workspace:Raycast(Vector3.new(X, FromY or 40, Z), Vector3.new(0, -200, 0), Params)
 	return Result and Result.Position or Vector3.new(X, 3, Z)
-end
-
-local function GetHumanoid()
-	local Character = Player.Character
-	return Character and Character:FindFirstChildOfClass("Humanoid")
 end
 
 local ActiveTween
 local MoveToken = 0
 local PullBackWarning -- diisi setelah fungsi Notify ada
 
--- Hentikan gerakan yang sedang berjalan (jalan aman / tween)
 local function StopMoving()
 	MoveToken += 1
 	if ActiveTween then
@@ -2636,7 +2650,6 @@ local function TeleportTo(TargetCFrame)
 		local Distance = (Root.Position - TargetCFrame.Position).Magnitude
 		local Duration = math.max(Distance / math.max(Settings.TweenSpeed, 1), 0.05)
 
-		-- Tahan karakter supaya tidak jatuh saat tween
 		local Hold = RunService.Heartbeat:Connect(function()
 			if Root.Parent then
 				Root.AssemblyLinearVelocity = Vector3.zero
@@ -2689,7 +2702,7 @@ local function Notify(Title, Content)
 end
 
 PullBackWarning = function()
-	Notify("Anti-cheat", 'Teleport ditarik balik server. Pakai mode "Jalan (Aman)" di Settings.')
+	Notify("Anti-cheat", 'Teleport ditarik balik server. Pakai mode "Jalan (Aman)".')
 end
 
 ---------------------------------------------------------------------
@@ -2711,7 +2724,6 @@ local function EggDisplayName(Model, Part)
 		return Label.Text
 	end
 
-	-- Cadangan (tidak di-cache, label mungkin belum terisi)
 	return Part:GetAttribute("EggInfoName") or Part:GetAttribute("EggType") or (Model.Name:gsub("^%d+:%s*", ""))
 end
 
@@ -2738,6 +2750,7 @@ local function ReadEgg(Model, ZoneId)
 		ZoneId = ZoneId,
 		Luck = ParseShort(Part:GetAttribute("EggInfoLuck")),
 		Weight = tonumber(Part:GetAttribute("WeightKg")) or 0,
+		Health = tonumber(Part:GetAttribute("Health")) or math.huge,
 		Position = Part.Position,
 		Size = Part.Size,
 	}
@@ -2777,9 +2790,13 @@ local function CollectEggs()
 	return Eggs
 end
 
+local function EggAlive(Egg)
+	return Egg.Model.Parent ~= nil and Egg.Part.Parent ~= nil and Egg.Part:GetAttribute("Broken") ~= true
+end
+
 local function Distance(Egg)
 	local Root = GetRoot()
-	return Root and (Egg.Position - Root.Position).Magnitude or 0
+	return Root and (Egg.Part.Position - Root.Position).Magnitude or 0
 end
 
 -- Teleport ke samping telur, menghadap telur
@@ -2788,9 +2805,8 @@ local function TeleportToEgg(Egg)
 		return false
 	end
 	local EggPos = Egg.Part.Position
-	local Radius = math.max(Egg.Size.X, Egg.Size.Z) / 2 + 3
+	local Radius = math.max(Egg.Size.X, Egg.Size.Z) / 2 + 2.5
 
-	-- Dekati dari arah pemain sekarang (lebih natural), cadangan dari sisi +X
 	local Root = GetRoot()
 	local Dir = Vector3.new(1, 0, 0)
 	if Root then
@@ -2803,9 +2819,20 @@ local function TeleportToEgg(Egg)
 	return TeleportTo(StandAt(EggPos + Dir * Radius, EggPos))
 end
 
--- Label dropdown: "Luna Egg [Void] - Fairy Castle"
 local function EggKey(Egg)
 	return string.format("%s [%s] - %s", Egg.Name, Egg.Rarity, ZoneName(Egg.ZoneId))
+end
+
+local function AllEggNames()
+	local Seen, List = {}, {}
+	for _, Egg in ipairs(CollectEggs()) do
+		if not Seen[Egg.Name] then
+			Seen[Egg.Name] = true
+			table.insert(List, Egg.Name)
+		end
+	end
+	table.sort(List)
+	return List
 end
 
 ---------------------------------------------------------------------
@@ -2826,19 +2853,14 @@ local function GetZoneList()
 	return Zones
 end
 
-local function ZoneLabel(ZoneId)
-	return string.format("%d. %s", ZoneIndex(ZoneId), ZoneName(ZoneId))
-end
-
 local function ZoneTargetCFrame(ZoneId)
 	local Build = GetBuild()
 	if not Build then
 		return nil
 	end
 
-	local Index = ZoneIndex(ZoneId)
 	local Hitboxes = Build:FindFirstChild("ZoneHitboxes")
-	local Hitbox = Hitboxes and Hitboxes:FindFirstChild(tostring(Index))
+	local Hitbox = Hitboxes and Hitboxes:FindFirstChild(tostring(ZoneIndex(ZoneId)))
 
 	if Settings.ZoneTarget == "Area Telur" then
 		local Sum, Count = Vector3.zero, 0
@@ -2851,7 +2873,6 @@ local function ZoneTargetCFrame(ZoneId)
 		if Count > 0 then
 			return StandAt(Sum / Count)
 		end
-		-- tidak ada telur -> lanjut ke pintu masuk
 	end
 
 	if Hitbox and Hitbox:IsA("BasePart") then
@@ -2859,12 +2880,11 @@ local function ZoneTargetCFrame(ZoneId)
 		if Settings.ZoneTarget == "Tengah Zona" then
 			return StandAt(Vector3.new(Center.X, 15, Center.Z))
 		end
-		-- Pintu masuk = sisi zona yang menghadap base (arah +X), menghadap ke dalam zona
+		-- Pintu masuk = sisi zona yang menghadap base (arah +X)
 		local Entrance = Vector3.new(Center.X + Hitbox.Size.X / 2 - 12, 15, Center.Z)
 		return StandAt(Entrance, Vector3.new(Center.X, 0, Center.Z))
 	end
 
-	-- Cadangan: pivot model zona
 	local ZoneBuilds = Build:FindFirstChild("ZoneBuilds")
 	local Zone = ZoneBuilds and ZoneBuilds:FindFirstChild(ZoneId)
 	if Zone and Zone:IsA("Model") then
@@ -2886,6 +2906,130 @@ local function MyPlot()
 	return nil
 end
 
+local function GoToBase()
+	local Plot = MyPlot()
+	local Spawn = Plot and (Plot:FindFirstChild("SpawnPoint") or Plot:FindFirstChild("Hitbox"))
+	if Spawn and Spawn:IsA("BasePart") then
+		return TeleportTo(StandAt(Spawn.Position))
+	end
+	Notify("Area", "Base kamu tidak ditemukan.")
+	return false
+end
+
+---------------------------------------------------------------------
+-- Pukul telur
+---------------------------------------------------------------------
+local function GetPickaxe()
+	for _, Container in ipairs({ Player.Character, Player:FindFirstChild("Backpack") }) do
+		if Container then
+			for _, Tool in ipairs(Container:GetChildren()) do
+				if Tool:IsA("Tool") and Tool.Name:find("Pickaxe") then
+					return Tool
+				end
+			end
+		end
+	end
+	return nil
+end
+
+local function EquipPickaxe()
+	local Tool, Humanoid = GetPickaxe(), GetHumanoid()
+	if Tool and Humanoid and Tool.Parent ~= Player.Character then
+		Humanoid:EquipTool(Tool)
+	end
+	return Tool
+end
+
+-- Nomor hit terakhir dari server (dipakai mode Remote)
+local HitSeq = 0
+local function TrackSeq(_, Seq)
+	if type(Seq) == "number" and Seq > HitSeq then
+		HitSeq = Seq
+	end
+end
+if Remotes.EggHitConfirmed then
+	Remotes.EggHitConfirmed.OnClientEvent:Connect(TrackSeq)
+end
+if Remotes.EggHitRejected then
+	Remotes.EggHitRejected.OnClientEvent:Connect(TrackSeq)
+end
+
+local function FaceEgg(Egg)
+	local Root = GetRoot()
+	if Root then
+		local Pos = Egg.Part.Position
+		Root.CFrame = CFrame.lookAt(Root.Position, Vector3.new(Pos.X, Root.Position.Y, Pos.Z))
+	end
+end
+
+local function HitEgg(Egg)
+	local Tool = EquipPickaxe()
+	FaceEgg(Egg)
+
+	if Farm.HitMode == "Remote (Cepat)" and Remotes.EggHitRequest and HitSeq > 0 then
+		HitSeq += 1
+		Remotes.EggHitRequest:FireServer(Egg.Part, HitSeq)
+	elseif Tool then
+		Tool:Activate()
+	end
+end
+
+---------------------------------------------------------------------
+-- Auto farm
+---------------------------------------------------------------------
+local Carried = 0 -- perkiraan jumlah hewan yang sedang dibawa
+
+if Remotes.AnimalBanked then
+	Remotes.AnimalBanked.OnClientEvent:Connect(function()
+		Carried = 0
+	end)
+end
+
+local function SatchelCapacity()
+	return tonumber(Player:GetAttribute("SatchelCapacity")) or 1
+end
+
+local function FarmFilter(Egg)
+	if #Farm.Zones > 0 and not table.find(Farm.Zones, ZoneName(Egg.ZoneId)) then
+		return false
+	end
+	if #Farm.Names > 0 and not table.find(Farm.Names, Egg.Name) then
+		return false
+	end
+	if #Farm.Rarities > 0 and not table.find(Farm.Rarities, Egg.Rarity) then
+		return false
+	end
+	if Egg.Weight < Farm.MinWeight then
+		return false
+	end
+	return true
+end
+
+local function FarmScore(Egg)
+	if Farm.Priority == "Luck Tertinggi" then
+		return -Egg.Luck
+	elseif Farm.Priority == "Terberat" then
+		return -Egg.Weight
+	elseif Farm.Priority == "HP Terendah" then
+		return Egg.Health
+	end
+	return Distance(Egg)
+end
+
+local function PickFarmEgg(Skip)
+	local Best, BestRank, BestScore = nil, nil, nil
+	for _, Egg in ipairs(CollectEggs()) do
+		if FarmFilter(Egg) and not Skip[Egg.Model] then
+			local Rank = (Farm.TitanicFirst and Egg.Name:lower():find("titanic")) and 0 or 1
+			local Score = FarmScore(Egg)
+			if not Best or Rank < BestRank or (Rank == BestRank and Score < BestScore) then
+				Best, BestRank, BestScore = Egg, Rank, Score
+			end
+		end
+	end
+	return Best
+end
+
 ---------------------------------------------------------------------
 -- UI
 ---------------------------------------------------------------------
@@ -2893,15 +3037,180 @@ local Window = Library:CreateWindow({
 	Title = "RapHub",
 	Description = "Break and Steal an Egg",
 	["Tab Width"] = 120,
-	SizeUi = UDim2.fromOffset(560, 340),
+	SizeUi = UDim2.fromOffset(580, 360),
 })
 
-local EggTab = Window:CreateTab({ Name = "Telur", Icon = "" })
-local AreaTab = Window:CreateTab({ Name = "Area", Icon = "" })
+local MainTab = Window:CreateTab({ Name = "Main", Icon = "" })
+local TeleportTab = Window:CreateTab({ Name = "Teleport", Icon = "" })
 local SettingTab = Window:CreateTab({ Name = "Settings", Icon = "" })
 
--- ===================== Tab Telur =====================
-local EggSection = EggTab:AddSection("Teleport Telur", true)
+-- ===================== Main: Auto Farm Eggs =====================
+local FarmSection = MainTab:AddSection("Auto Farm Eggs", true)
+
+local FarmStatus = FarmSection:AddParagraph({
+	Title = "Status",
+	Content = "Mati",
+})
+
+local LastStatus = ""
+local function SetStatus(Text)
+	if Text ~= LastStatus then
+		LastStatus = Text
+		task.spawn(function()
+			pcall(function()
+				FarmStatus:Set({ Title = "Status", Content = Text })
+			end)
+		end)
+	end
+end
+
+local ZoneNameOptions = {}
+for _, ZoneId in ipairs(GetZoneList()) do
+	table.insert(ZoneNameOptions, ZoneName(ZoneId))
+end
+
+FarmSection:AddDropdown({
+	Title = "Zones (kosong = semua)",
+	Content = "Zona tempat farm",
+	Multi = true,
+	Options = ZoneNameOptions,
+	Default = {},
+	Callback = function(Value)
+		Farm.Zones = Value or {}
+	end,
+})
+
+local FarmNameDropdown = FarmSection:AddDropdown({
+	Title = "Egg Types (kosong = semua)",
+	Content = "Jenis telur",
+	Multi = true,
+	Options = AllEggNames(),
+	Default = {},
+	Callback = function(Value)
+		Farm.Names = Value or {}
+	end,
+})
+
+FarmSection:AddDropdown({
+	Title = "Egg Rarities (kosong = semua)",
+	Content = "Rarity telur",
+	Multi = true,
+	Options = table.clone(RARITY_ORDER),
+	Default = {},
+	Callback = function(Value)
+		Farm.Rarities = Value or {}
+	end,
+})
+
+FarmSection:AddInput({
+	Title = "Min Berat (kg)",
+	Content = "Lewati telur yang lebih ringan",
+	Default = "0",
+	Callback = function(Value)
+		Farm.MinWeight = tonumber(Value) or 0
+	end,
+})
+
+FarmSection:AddDropdown({
+	Title = "Egg Priority",
+	Content = "Telur mana yang dipukul dulu",
+	Multi = false,
+	Options = { "Terdekat", "Luck Tertinggi", "Terberat", "HP Terendah" },
+	Default = { "Terdekat" },
+	Callback = function(Value)
+		Farm.Priority = Value and Value[1] or "Terdekat"
+	end,
+})
+
+FarmSection:AddToggle({
+	Title = "Titanic Eggs First",
+	Content = "Dahulukan telur Titanic kalau muncul",
+	Default = true,
+	Callback = function(Value)
+		Farm.TitanicFirst = Value
+	end,
+})
+
+FarmSection:AddDropdown({
+	Title = "Farm Mode",
+	Content = "Cara pindah ke telur",
+	Multi = false,
+	Options = { "Jalan (Aman)", "Instant", "Tween" },
+	Default = { "Jalan (Aman)" },
+	Callback = function(Value)
+		Settings.TeleportMode = Value and Value[1] or "Jalan (Aman)"
+	end,
+})
+
+FarmSection:AddDropdown({
+	Title = "Cara Pukul",
+	Content = "Tool = lewat pickaxe, Remote = kirim hit langsung",
+	Multi = false,
+	Options = { "Tool (Aman)", "Remote (Cepat)" },
+	Default = { "Tool (Aman)" },
+	Callback = function(Value)
+		Farm.HitMode = Value and Value[1] or "Tool (Aman)"
+	end,
+})
+
+FarmSection:AddToggle({
+	Title = "Pulang Saat Satchel Penuh",
+	Content = "Bawa hewan ke base supaya tersimpan",
+	Default = true,
+	Callback = function(Value)
+		Farm.ReturnWhenFull = Value
+	end,
+})
+
+FarmSection:AddToggle({
+	Title = "Auto Farm Eggs",
+	Content = "Mulai farm",
+	Default = false,
+	Callback = function(Value)
+		Farm.Enabled = Value
+		if not Value then
+			StopMoving()
+			SetStatus("Mati")
+		end
+	end,
+})
+
+FarmSection:AddButton({
+	Title = "Refresh Egg Types",
+	Content = "Ambil ulang nama telur di map",
+	Callback = function()
+		FarmNameDropdown:Refresh(AllEggNames(), Farm.Names)
+	end,
+})
+
+local FarmTune = MainTab:AddSection("Pengaturan Farm", false)
+
+FarmTune:AddSlider({
+	Title = "Jeda Pukulan (x0.01 detik)",
+	Content = "Makin kecil makin cepat",
+	Increment = 1,
+	Min = 5,
+	Max = 100,
+	Default = 15,
+	Callback = function(Value)
+		Farm.HitDelay = Value / 100
+	end,
+})
+
+FarmTune:AddSlider({
+	Title = "Maks Waktu per Telur",
+	Content = "Detik sebelum pindah telur lain",
+	Increment = 1,
+	Min = 5,
+	Max = 120,
+	Default = Farm.MaxTimePerEgg,
+	Callback = function(Value)
+		Farm.MaxTimePerEgg = Value
+	end,
+})
+
+-- ===================== Teleport =====================
+local EggSection = TeleportTab:AddSection("Teleport Telur", true)
 
 local EggInfo = EggSection:AddParagraph({
 	Title = "Telur di map",
@@ -2922,18 +3231,16 @@ local EggDropdown = EggSection:AddDropdown({
 	end,
 })
 
--- Susun daftar telur (urut zona lalu nama) + perbarui info
 local function RefreshEggList(Force)
 	local Eggs = CollectEggs()
-	local Count, Order = {}, {}
+	local Seen, Order = {}, {}
 
 	for _, Egg in ipairs(Eggs) do
 		local Key = EggKey(Egg)
-		if not Count[Key] then
-			Count[Key] = 0
+		if not Seen[Key] then
+			Seen[Key] = true
 			table.insert(Order, { Key = Key, Zone = ZoneIndex(Egg.ZoneId), Name = Egg.Name })
 		end
-		Count[Key] += 1
 	end
 
 	table.sort(Order, function(a, b)
@@ -2960,8 +3267,6 @@ local function RefreshEggList(Force)
 		Title = "Telur di map",
 		Content = string.format("%d telur, %d jenis", #Eggs, #Options),
 	})
-
-	return Eggs
 end
 
 local function NearestEgg(Filter)
@@ -3010,138 +3315,14 @@ EggSection:AddButton({
 	end,
 })
 
-EggSection:AddButton({
-	Title = "Refresh Daftar Telur",
-	Content = "Daftar juga diperbarui otomatis",
-	Callback = function()
-		RefreshEggList(true)
-	end,
-})
-
--- ===================== Auto Telur =====================
-local AutoSection = EggTab:AddSection("Auto Teleport Telur", false)
-
-local AutoEgg = false
-AutoSection:AddToggle({
-	Title = "Auto Teleport Telur",
-	Content = "Pindah ke telur berikutnya saat telur pecah / hilang",
-	Default = false,
-	Callback = function(Value)
-		AutoEgg = Value
-		if not Value then
-			StopMoving()
-		end
-	end,
-})
-
-AutoSection:AddDropdown({
-	Title = "Prioritas",
-	Content = "Telur mana yang didatangi dulu",
-	Multi = false,
-	Options = { "Terdekat", "Luck Tertinggi", "Terberat" },
-	Default = { "Terdekat" },
-	Callback = function(Value)
-		Settings.AutoPriority = Value and Value[1] or "Terdekat"
-	end,
-})
-
-local function AllEggNames()
-	local Seen, List = {}, {}
-	for _, Egg in ipairs(CollectEggs()) do
-		if not Seen[Egg.Name] then
-			Seen[Egg.Name] = true
-			table.insert(List, Egg.Name)
-		end
-	end
-	table.sort(List)
-	return List
-end
-
-local NameFilter = AutoSection:AddDropdown({
-	Title = "Filter Nama Telur",
-	Content = "Kosong = semua telur",
-	Multi = true,
-	Options = AllEggNames(),
-	Default = {},
-	Callback = function(Value)
-		Settings.AutoNames = Value or {}
-	end,
-})
-
-AutoSection:AddDropdown({
-	Title = "Filter Rarity",
-	Content = "Kosong = semua rarity",
-	Multi = true,
-	Options = table.clone(RARITY_ORDER),
-	Default = {},
-	Callback = function(Value)
-		Settings.AutoRarities = Value or {}
-	end,
-})
-
-AutoSection:AddButton({
-	Title = "Refresh Filter Nama",
-	Content = "Ambil ulang nama telur di map",
-	Callback = function()
-		NameFilter:Refresh(AllEggNames(), Settings.AutoNames)
-	end,
-})
-
-AutoSection:AddSlider({
-	Title = "Maks Waktu per Telur",
-	Content = "Detik sebelum pindah telur",
-	Increment = 1,
-	Min = 2,
-	Max = 60,
-	Default = Settings.AutoStayTime,
-	Callback = function(Value)
-		Settings.AutoStayTime = Value
-	end,
-})
-
-local function PassAutoFilter(Egg)
-	if #Settings.AutoNames > 0 and not table.find(Settings.AutoNames, Egg.Name) then
-		return false
-	end
-	if #Settings.AutoRarities > 0 and not table.find(Settings.AutoRarities, Egg.Rarity) then
-		return false
-	end
-	return true
-end
-
-local function PickAutoEgg(Skip)
-	local Best, BestScore = nil, nil
-	for _, Egg in ipairs(CollectEggs()) do
-		if PassAutoFilter(Egg) and not Skip[Egg.Model] then
-			local Score
-			if Settings.AutoPriority == "Luck Tertinggi" then
-				Score = -Egg.Luck
-			elseif Settings.AutoPriority == "Terberat" then
-				Score = -Egg.Weight
-			else
-				Score = Distance(Egg)
-			end
-			if not BestScore or Score < BestScore then
-				Best, BestScore = Egg, Score
-			end
-		end
-	end
-	return Best
-end
-
--- ===================== Tab Area =====================
-local ZoneSection = AreaTab:AddSection("Teleport Zona", true)
+local ZoneSection = TeleportTab:AddSection("Teleport Zona", true)
 
 local ZoneByLabel = {}
-local function ZoneOptions()
-	ZoneByLabel = {}
-	local List = {}
-	for _, ZoneId in ipairs(GetZoneList()) do
-		local Label = ZoneLabel(ZoneId)
-		ZoneByLabel[Label] = ZoneId
-		table.insert(List, Label)
-	end
-	return List
+local ZoneLabels = {}
+for _, ZoneId in ipairs(GetZoneList()) do
+	local Label = string.format("%d. %s", ZoneIndex(ZoneId), ZoneName(ZoneId))
+	ZoneByLabel[Label] = ZoneId
+	table.insert(ZoneLabels, Label)
 end
 
 local SelectedZone = nil
@@ -3149,7 +3330,7 @@ ZoneSection:AddDropdown({
 	Title = "Pilih Zona",
 	Content = "Semua zona di map",
 	Multi = false,
-	Options = ZoneOptions(),
+	Options = ZoneLabels,
 	Default = {},
 	Callback = function(Value)
 		SelectedZone = Value and Value[1] and ZoneByLabel[Value[1]] or nil
@@ -3184,20 +3365,12 @@ ZoneSection:AddButton({
 	end,
 })
 
-local PlaceSection = AreaTab:AddSection("Lokasi Lain", true)
+local PlaceSection = TeleportTab:AddSection("Lokasi Lain", false)
 
 PlaceSection:AddButton({
 	Title = "Base Saya",
 	Content = "Kembali ke plot milikmu",
-	Callback = function()
-		local Plot = MyPlot()
-		local Spawn = Plot and (Plot:FindFirstChild("SpawnPoint") or Plot:FindFirstChild("Hitbox"))
-		if Spawn and Spawn:IsA("BasePart") then
-			TeleportTo(StandAt(Spawn.Position))
-		else
-			Notify("Area", "Base kamu tidak ditemukan.")
-		end
-	end,
+	Callback = GoToBase,
 })
 
 local function AddModelButton(Title, Content, ModelName)
@@ -3222,17 +3395,6 @@ AddModelButton("Fuse Machine", "Mesin fuse", "FuseMachine")
 -- ===================== Settings =====================
 local TpSection = SettingTab:AddSection("Teleport", true)
 
-TpSection:AddDropdown({
-	Title = "Mode Teleport",
-	Content = "Jalan (Aman) = lolos anti-cheat. Instant/Tween bisa ditarik balik",
-	Multi = false,
-	Options = { "Jalan (Aman)", "Instant", "Tween" },
-	Default = { "Jalan (Aman)" },
-	Callback = function(Value)
-		Settings.TeleportMode = Value and Value[1] or "Jalan (Aman)"
-	end,
-})
-
 TpSection:AddSlider({
 	Title = "Pengali Kecepatan Jalan",
 	Content = "x WalkSpeed (dibagi 10). 10 = normal, makin besar makin berisiko",
@@ -3245,17 +3407,9 @@ TpSection:AddSlider({
 	end,
 })
 
-TpSection:AddButton({
-	Title = "Stop Gerak",
-	Content = "Hentikan perjalanan yang sedang berlangsung",
-	Callback = function()
-		StopMoving()
-	end,
-})
-
 TpSection:AddSlider({
 	Title = "Kecepatan Tween",
-	Content = "Stud per detik",
+	Content = "Stud per detik (mode Tween)",
 	Increment = 10,
 	Min = 50,
 	Max = 1000,
@@ -3263,6 +3417,12 @@ TpSection:AddSlider({
 	Callback = function(Value)
 		Settings.TweenSpeed = Value
 	end,
+})
+
+TpSection:AddButton({
+	Title = "Stop Gerak",
+	Content = "Hentikan perjalanan yang sedang berlangsung",
+	Callback = StopMoving,
 })
 
 local UiSection = SettingTab:AddSection("Panel", true)
@@ -3276,7 +3436,6 @@ UiSection:AddParagraph({
 ---------------------------------------------------------------------
 RefreshEggList(true)
 
--- Perbarui daftar telur berkala (pilihan tetap dipertahankan)
 task.spawn(function()
 	while not Library.Unloaded do
 		task.wait(4)
@@ -3284,38 +3443,66 @@ task.spawn(function()
 	end
 end)
 
--- Auto: datangi telur, tunggu sampai pecah/hilang atau waktu habis, lalu lanjut
+-- Auto farm
 task.spawn(function()
 	local Skip = setmetatable({}, { __mode = "k" })
 
 	while not Library.Unloaded do
-		if AutoEgg then
-			local Egg = PickAutoEgg(Skip)
-			if Egg then
-				TeleportToEgg(Egg)
+		if not Farm.Enabled then
+			task.wait(0.3)
+			continue
+		end
 
+		-- Satchel penuh -> pulang ke base supaya hewan tersimpan
+		if Farm.ReturnWhenFull and Carried >= SatchelCapacity() then
+			SetStatus(string.format("Pulang ke base (bawa %d hewan)", Carried))
+			if GoToBase() then
 				local Started = os.clock()
-				while
-					AutoEgg
-					and not Library.Unloaded
-					and Egg.Model.Parent
-					and Egg.Part.Parent
-					and Egg.Part:GetAttribute("Broken") ~= true
-					and os.clock() - Started < Settings.AutoStayTime
-				do
-					task.wait(0.25)
+				while Farm.Enabled and Carried > 0 and os.clock() - Started < 5 do
+					task.wait(0.2)
 				end
-
-				-- Waktu habis tapi telur masih ada: lewati sementara
-				if Egg.Model.Parent and Egg.Part:GetAttribute("Broken") ~= true then
-					Skip[Egg.Model] = true
-				end
-			else
-				table.clear(Skip)
-				task.wait(1)
 			end
-		else
-			task.wait(0.5)
+			Carried = 0
+			continue
+		end
+
+		local Egg = PickFarmEgg(Skip)
+		if not Egg then
+			SetStatus("Menunggu telur yang cocok...")
+			table.clear(Skip)
+			task.wait(1)
+			continue
+		end
+
+		local Label = string.format("%s (%s)", Egg.Name, ZoneName(Egg.ZoneId))
+		SetStatus("Menuju " .. Label)
+
+		if Distance(Egg) > 10 then
+			TeleportToEgg(Egg)
+		end
+
+		local Started, Hits = os.clock(), 0
+		while Farm.Enabled and not Library.Unloaded and EggAlive(Egg) do
+			if os.clock() - Started > Farm.MaxTimePerEgg then
+				Skip[Egg.Model] = true
+				break
+			end
+
+			-- Terpental (guard / dorongan) -> dekati lagi
+			if Distance(Egg) > 12 then
+				SetStatus("Menuju " .. Label)
+				TeleportToEgg(Egg)
+			end
+
+			SetStatus(string.format("Memukul %s | bawa %d/%d", Label, Carried, SatchelCapacity()))
+			HitEgg(Egg)
+			Hits += 1
+			task.wait(Farm.HitDelay)
+		end
+
+		-- Telur pecah saat kita memukul -> hewan ikut dibawa
+		if Farm.Enabled and Hits > 0 and not EggAlive(Egg) then
+			Carried += 1
 		end
 	end
 end)
