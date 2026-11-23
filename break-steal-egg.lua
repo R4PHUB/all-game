@@ -2447,6 +2447,20 @@ local Farm = {
 	BankMode = "Lewat Guard (Cepat)", -- "Lewat Guard (Cepat)" | "Jalan ke Base"
 }
 
+local Steal = {
+	Enabled = false, -- ambil hewan yang bisa dicuri (StealPrompt) lalu setor
+	Dropped = true, -- hewan jatuh / tergeletak di map
+	OtherBases = false, -- hewan di base pemain lain
+	Rarities = {}, -- kosong = semua
+	MinWeight = 0, -- kg
+	MutationOnly = false, -- hanya yang punya mutasi
+}
+
+-- Farm atau steal sedang aktif
+local function Working()
+	return Farm.Enabled or Steal.Enabled
+end
+
 ---------------------------------------------------------------------
 -- Data game (dibaca dari ReplicatedStorage.Shared, ada cadangan)
 ---------------------------------------------------------------------
@@ -3516,7 +3530,7 @@ FarmSection:AddToggle({
 	Default = false,
 	Callback = function(Value)
 		Farm.Enabled = Value
-		if not Value then
+		if not Value and not Steal.Enabled then
 			StopMoving()
 			SetStatus("Mati")
 		end
@@ -3528,6 +3542,74 @@ FarmSection:AddButton({
 	Content = "Ambil ulang nama telur di map",
 	Callback = function()
 		FarmNameDropdown:Refresh(AllEggNames(), Farm.Names)
+	end,
+})
+
+-- ===================== Main: Auto Steal =====================
+local StealSection = MainTab:AddSection("Auto Steal", true)
+
+local StealInfo = StealSection:AddParagraph({
+	Title = "Hewan bisa dicuri",
+	Content = "Menghitung...",
+})
+
+StealSection:AddToggle({
+	Title = "Auto Steal",
+	Content = "Ambil hewan yang lolos filter (bukan harus pecahan sendiri) lalu setor ke SafeZone",
+	Default = false,
+	Callback = function(Value)
+		Steal.Enabled = Value
+		if not Value and not Farm.Enabled then
+			StopMoving()
+			SetStatus("Mati")
+		end
+	end,
+})
+
+StealSection:AddToggle({
+	Title = "Curi Hewan Jatuh",
+	Content = "Hewan tergeletak di map (mis. pemain lain ditangkap guard)",
+	Default = true,
+	Callback = function(Value)
+		Steal.Dropped = Value
+	end,
+})
+
+StealSection:AddToggle({
+	Title = "Curi dari Base Pemain Lain",
+	Content = "Hewan yang ditaruh di base orang lain",
+	Default = false,
+	Callback = function(Value)
+		Steal.OtherBases = Value
+	end,
+})
+
+StealSection:AddDropdown({
+	Title = "Animal Rarities (kosong = semua)",
+	Content = "Hanya curi rarity ini",
+	Multi = true,
+	Options = table.clone(RARITY_ORDER),
+	Default = {},
+	Callback = function(Value)
+		Steal.Rarities = Value or {}
+	end,
+})
+
+StealSection:AddInput({
+	Title = "Min Berat Hewan (kg)",
+	Content = "Lewati hewan yang lebih ringan",
+	Default = "0",
+	Callback = function(Value)
+		Steal.MinWeight = tonumber(Value) or 0
+	end,
+})
+
+StealSection:AddToggle({
+	Title = "Hanya yang Bermutasi",
+	Content = "Gold, Hacker, dll",
+	Default = false,
+	Callback = function(Value)
+		Steal.MutationOnly = Value
 	end,
 })
 
@@ -3902,11 +3984,11 @@ local function BankAndPlace()
 	end
 
 	local Started = os.clock()
-	while Farm.Enabled and CarryCount() > 0 and os.clock() - Started < 6 do
+	while Working() and CarryCount() > 0 and os.clock() - Started < 6 do
 		task.wait(0.2)
 	end
 
-	if Place.Auto and Farm.Enabled and #AnimalTools() > 0 then
+	if Place.Auto and Working() and #AnimalTools() > 0 then
 		SetStatus("Menaruh hewan di base...")
 		PlaceAllAnimals()
 	end
@@ -4018,7 +4100,7 @@ local function BankViaGuard()
 
 	-- 1. Lompat ke arah guard sampai ditangkap
 	local Expected = nil
-	while Farm.Enabled and Token == MoveToken and Fling.Count == StartFlings and os.clock() - Started < 8 do
+	while Working() and Token == MoveToken and Fling.Count == StartFlings and os.clock() - Started < 8 do
 		local GuardPos = GuardPosition(Guard)
 		local R, Hum = GetRoot(), GetHumanoid()
 		if not GuardPos or not R or not Hum then
@@ -4089,6 +4171,160 @@ local function Bank()
 	BankAndPlace()
 end
 
+---------------------------------------------------------------------
+-- Auto steal: StealPrompt (tag "SmartPrompt") milik hewan yang bisa diambil
+---------------------------------------------------------------------
+local STEAL_ATTRS = { "AnimalName", "Rarity", "WeightKg", "Mutation", "OwnerUserId", "Variant", "SizeMult" }
+
+local function PromptPosition(Prompt)
+	local Parent = Prompt.Parent
+	if Parent and Parent:IsA("Attachment") then
+		return Parent.WorldPosition
+	elseif Parent and Parent:IsA("BasePart") then
+		return Parent.Position
+	end
+	local Model = Prompt:FindFirstAncestorWhichIsA("Model")
+	if Model then
+		local ok, Pivot = pcall(function()
+			return Model:GetPivot().Position
+		end)
+		if ok then
+			return Pivot
+		end
+	end
+	return nil
+end
+
+-- Info hewan: atribut dari prompt & leluhurnya, cadangan ObjectText prompt
+local function PromptInfo(Prompt)
+	local Info = {}
+	local Node = Prompt
+	for _ = 1, 6 do
+		if not Node or Node == workspace then
+			break
+		end
+		for _, Key in ipairs(STEAL_ATTRS) do
+			if Info[Key] == nil then
+				Info[Key] = Node:GetAttribute(Key)
+			end
+		end
+		Node = Node.Parent
+	end
+	Info.Name = Info.AnimalName or (Prompt.ObjectText ~= "" and Prompt.ObjectText) or "Hewan"
+	return Info
+end
+
+local function AllStealPrompts()
+	local List, Seen = {}, {}
+	local function Add(Prompt)
+		if not Seen[Prompt] and Prompt:IsA("ProximityPrompt") and Prompt.Name == "StealPrompt" then
+			Seen[Prompt] = true
+			table.insert(List, Prompt)
+		end
+	end
+	for _, Prompt in ipairs(CollectionService:GetTagged("SmartPrompt")) do
+		Add(Prompt)
+	end
+	-- Cadangan: prompt di PromptAnchor / AnimalPickups
+	for _, Child in ipairs(workspace:GetChildren()) do
+		if Child.Name == "PromptAnchor" or Child.Name == "AnimalPickups" then
+			for _, D in ipairs(Child:GetDescendants()) do
+				Add(D)
+			end
+		end
+	end
+	return List
+end
+
+local function StealFilter(Info)
+	if #Steal.Rarities > 0 and not table.find(Steal.Rarities, Info.Rarity) then
+		return false
+	end
+	local Weight = tonumber(Info.WeightKg)
+	if Steal.MinWeight > 0 and Weight and Weight < Steal.MinWeight then
+		return false
+	end
+	if Steal.MutationOnly and (Info.Mutation == nil or Info.Mutation == "") then
+		return false
+	end
+	return true
+end
+
+local StealSkip = setmetatable({}, { __mode = "k" })
+
+local function StealTargets()
+	local List = {}
+	local Root = GetRoot()
+	local Plot = MyPlot()
+	local Plots = workspace:FindFirstChild("Plots")
+
+	for _, Prompt in ipairs(AllStealPrompts()) do
+		if Prompt:IsDescendantOf(workspace) and not StealSkip[Prompt] and not (Plot and Prompt:IsDescendantOf(Plot)) then
+			local InBase = Plots ~= nil and Prompt:IsDescendantOf(Plots)
+			if (InBase and Steal.OtherBases) or (not InBase and Steal.Dropped) then
+				local Pos = PromptPosition(Prompt)
+				if Pos then
+					local Info = PromptInfo(Prompt)
+					if StealFilter(Info) then
+						Info.Prompt = Prompt
+						Info.Position = Pos
+						Info.InBase = InBase
+						Info.Distance = Root and (Pos - Root.Position).Magnitude or 0
+						table.insert(List, Info)
+					end
+				end
+			end
+		end
+	end
+
+	table.sort(List, function(a, b)
+		return a.Distance < b.Distance
+	end)
+	return List
+end
+
+-- Datangi prompt, tekan sampai hewan terbawa (CarryCount naik)
+local function StealOne(Info)
+	SetStatus("Mencuri " .. Info.Name .. (Info.Rarity and (" [" .. tostring(Info.Rarity) .. "]") or ""))
+	local Before = CarryCount()
+
+	if Info.Distance > 8 then
+		if not TeleportTo(StandAt(Info.Position, Info.Position)) then
+			StealSkip[Info.Prompt] = true
+			return false
+		end
+	end
+
+	local Started = os.clock()
+	while os.clock() - Started < 3 and CarryCount() <= Before and Info.Prompt.Parent do
+		FirePrompt(Info.Prompt)
+		task.wait(0.15)
+	end
+
+	if CarryCount() > Before then
+		return true
+	end
+	StealSkip[Info.Prompt] = true
+	return false
+end
+
+-- Info jumlah target curi
+task.spawn(function()
+	local Last = ""
+	while not Library.Unloaded do
+		local ok, Targets = pcall(StealTargets)
+		local Text = ok and string.format("%d hewan lolos filter (total StealPrompt: %d)", #Targets, #AllStealPrompts())
+			or "Gagal membaca"
+		if Text ~= Last then
+			Last = Text
+			pcall(function()
+				StealInfo:Set({ Title = "Hewan bisa dicuri", Content = Text })
+			end)
+		end
+		task.wait(3)
+	end
+end)
+
 -- Auto farm: satu langkah per panggilan, dibungkus pcall supaya error terlihat
 local LastFarmError = nil
 local FarmSkip = setmetatable({}, { __mode = "k" })
@@ -4103,6 +4339,26 @@ local function FarmStep()
 	-- Satchel penuh -> setor
 	if Farm.ReturnWhenFull and CarryCount() >= SatchelCapacity() then
 		Bank()
+		return
+	end
+
+	-- Auto steal dulu (hewan siap ambil lebih cepat daripada memecah telur)
+	if Steal.Enabled and CarryCount() < SatchelCapacity() then
+		local Target = StealTargets()[1]
+		if Target then
+			StealOne(Target)
+			return
+		end
+	end
+
+	-- Hanya steal: setor yang dibawa, lalu tunggu target baru
+	if not Farm.Enabled then
+		if Farm.ReturnWhenFull and CarryCount() > 0 then
+			Bank()
+			return
+		end
+		SetStatus("Menunggu hewan untuk dicuri...")
+		task.wait(0.5)
 		return
 	end
 
@@ -4153,7 +4409,7 @@ end
 
 task.spawn(function()
 	while not Library.Unloaded do
-		if not Farm.Enabled then
+		if not Working() then
 			task.wait(0.3)
 		else
 			local ok, Err = pcall(FarmStep)
@@ -4222,6 +4478,71 @@ DiagSection:AddButton({
 		end
 		HitEgg(Best)
 		Notify("Tes", string.format("Pukul %s (jarak %.1f stud). Lihat HP telurnya turun atau tidak.", Best.Name, BestDist))
+	end,
+})
+
+-- Tulis detail semua ProximityPrompt di map ke file (untuk menyempurnakan auto steal)
+DiagSection:AddButton({
+	Title = "Scan Steal Prompt",
+	Content = "Simpan detail prompt hewan ke RapHub/StealScan.txt",
+	Callback = function()
+		local Lines = { "== StealScan  PlaceId " .. game.PlaceId, "" }
+		local Root = GetRoot()
+		local Count, StealCount = 0, 0
+
+		for _, Prompt in ipairs(workspace:GetDescendants()) do
+			if Prompt:IsA("ProximityPrompt") then
+				Count += 1
+				if Prompt.Name == "StealPrompt" then
+					StealCount += 1
+				end
+				if Count <= 150 then
+					local Pos = PromptPosition(Prompt)
+					local Tags = table.concat(CollectionService:GetTags(Prompt), ",")
+					table.insert(Lines, string.format(
+						"%s | name=%s action=%q object=%q enabled=%s hold=%.2f dist=%.0f tags=%s | jarak=%s",
+						Prompt:GetFullName(),
+						Prompt.Name,
+						Prompt.ActionText,
+						Prompt.ObjectText,
+						tostring(Prompt.Enabled),
+						Prompt.HoldDuration,
+						Prompt.MaxActivationDistance,
+						Tags,
+						(Pos and Root) and string.format("%.0f", (Pos - Root.Position).Magnitude) or "?"
+					))
+					-- Atribut leluhur (3 tingkat)
+					local Node = Prompt.Parent
+					for Level = 1, 3 do
+						if not Node or Node == workspace then
+							break
+						end
+						local Attrs = {}
+						for Key, Value in pairs(Node:GetAttributes()) do
+							table.insert(Attrs, Key .. "=" .. tostring(Value))
+						end
+						table.sort(Attrs)
+						table.insert(Lines, string.format(
+							"    ^%d %s [%s] {%s}",
+							Level,
+							Node.Name,
+							Node.ClassName,
+							table.concat(Attrs, ", ")
+						))
+						Node = Node.Parent
+					end
+				end
+			end
+		end
+
+		table.insert(Lines, "")
+		table.insert(Lines, string.format("Total prompt: %d | StealPrompt: %d", Count, StealCount))
+		local Text = table.concat(Lines, "\n")
+		local Saved = writefile and pcall(writefile, "RapHub/StealScan.txt", Text)
+		if not Saved and setclipboard then
+			pcall(setclipboard, Text)
+		end
+		Notify("Scan", string.format("%d prompt (%d StealPrompt). %s", Count, StealCount, Saved and "Tersimpan RapHub/StealScan.txt" or "Di-copy ke clipboard"))
 	end,
 })
 
