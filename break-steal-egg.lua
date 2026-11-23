@@ -63,7 +63,7 @@ end
 
 -- Logo tombol buka panel (muncul saat panel di-minimize).
 -- Ganti dengan asset ID gambar logo bulat kamu, contoh: "rbxassetid://1234567890"
-Custom.LogoImage = "rbxassetid://117841126878884"
+Custom.LogoImage = "rbxassetid://139538771251251"
 
 -- Hapus panel lama kalau script dieksekusi ulang
 local Env = (getgenv and getgenv()) or _G
