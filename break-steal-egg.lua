@@ -2424,8 +2424,9 @@ local Player = Players.LocalPlayer
 -- Setting
 ---------------------------------------------------------------------
 local Settings = {
-	TeleportMode = "Instant (Lompat)", -- "Instant (Lompat)" | "Jalan (Aman)" | "Tween"
-	StepSize = 28, -- stud per frame untuk mode Instant (Lompat), sama seperti Lynx
+	TeleportMode = "Instant (Lynx)", -- "Instant (Lynx)" | "Jalan (Aman)"
+	StepSize = 28, -- stud per frame untuk lompat jarak dekat (Lynx ~28)
+	ShortRange = 150, -- di atas jarak ini pakai respawn teleport
 	WalkMultiplier = 1, -- pengali WalkSpeed untuk mode Jalan (Aman)
 	TweenSpeed = 300, -- stud per detik
 	ZoneTarget = "Pintu Masuk", -- "Pintu Masuk" | "Tengah Zona" | "Area Telur"
@@ -2652,10 +2653,13 @@ local function InFlingWindow()
 	return os.clock() < Fling.Until
 end
 
+local LastMoveProblem = nil -- ditampilkan di panel Diagnosa
+local MoveNotify -- diisi setelah fungsi Notify ada
+
 --[[
-	Mode "Instant (Lompat)": lompat StepSize stud per frame menyusuri tanah.
-	Lompatan kecil per frame tidak ditarik balik server (terbukti dari rekaman Lynx).
-	Kalau ternyata ditarik balik, jarak lompat otomatis dikecilkan.
+	Lompat kecil per frame (jarak DEKAT saja). Lynx hanya memakai ini untuk
+	ledakan pendek (~250 stud). Kalau server menarik balik sekali saja,
+	langsung berhenti (mengulang terus = diledakkan anti-cheat).
 ]]
 local function StepTo(TargetCFrame, Token)
 	local Root, Humanoid = GetRoot(), GetHumanoid()
@@ -2665,24 +2669,20 @@ local function StepTo(TargetCFrame, Token)
 
 	local Target = TargetCFrame.Position
 	local HipOffset = Humanoid.HipHeight + Root.Size.Y / 2
-	local Expected, PullBacks = nil, 0
+	local Expected = nil
 
 	while Token == MoveToken and Root.Parent and Humanoid.Health > 0 do
 		if InFlingWindow() then
-			break -- bebas teleport langsung
+			break
 		end
 
 		local Pos = Root.Position
 		if Expected and (Pos - Expected).Magnitude > 40 then
-			PullBacks += 1
-			if PullBacks % 3 == 0 and Settings.StepSize > 10 then
-				Settings.StepSize = math.max(10, math.floor(Settings.StepSize * 0.7))
-				if PullBackWarning then
-					PullBackWarning()
-				end
+			LastMoveProblem = "Lompat ditarik balik server"
+			if PullBackWarning then
+				PullBackWarning()
 			end
-			task.wait(0.3)
-			Pos = Root.Position
+			return false
 		end
 
 		local Flat = Vector3.new(Target.X - Pos.X, 0, Target.Z - Pos.Z)
@@ -2711,6 +2711,71 @@ local function StepTo(TargetCFrame, Token)
 	return true
 end
 
+--[[
+	Respawn Teleport (jarak JAUH, cara Lynx dari rekaman):
+	HRP di-anchor -> karakter dimatikan -> begitu karakter baru muncul,
+	langsung dipindah ke tujuan pada frame-frame pertama, sebelum anti-cheat
+	server mulai mengawasi karakter baru. Tidak dipakai saat membawa hewan
+	(hewan bisa jatuh saat mati).
+]]
+local Respawning = false
+local function RespawnTo(TargetCFrame, Token)
+	local Root, Humanoid = GetRoot(), GetHumanoid()
+	if Respawning or not Root or not Humanoid then
+		return false
+	end
+	Respawning = true
+
+	local Arrived = false
+	local Conn = Player.CharacterAdded:Connect(function(Character)
+		local NewRoot = Character:WaitForChild("HumanoidRootPart", 5)
+		if not NewRoot then
+			return
+		end
+		-- Tahan di tujuan selama frame-frame awal karakter baru
+		local Until = os.clock() + 0.6
+		while os.clock() < Until and NewRoot.Parent do
+			NewRoot.CFrame = TargetCFrame
+			NewRoot.AssemblyLinearVelocity = Vector3.zero
+			RunService.Heartbeat:Wait()
+		end
+		Arrived = true
+	end)
+
+	pcall(function()
+		Root.Anchored = true
+		Humanoid.Health = 0
+	end)
+
+	local Started = os.clock()
+	while not Arrived and Token == MoveToken and os.clock() - Started < 12 do
+		task.wait(0.05)
+	end
+	Conn:Disconnect()
+	Respawning = false
+
+	if not Arrived then
+		LastMoveProblem = "Respawn teleport gagal / timeout"
+		return false
+	end
+
+	-- Cek apakah posisi bertahan
+	task.wait(1)
+	local NewRoot = GetRoot()
+	if NewRoot and (NewRoot.Position - TargetCFrame.Position).Magnitude > 40 then
+		LastMoveProblem = "Respawn teleport ditarik balik"
+		if MoveNotify then
+			MoveNotify("Respawn teleport ditarik balik server.")
+		end
+		return false
+	end
+	return true
+end
+
+local function IsCarrying()
+	return Player:GetAttribute("Carrying") ~= nil
+end
+
 local function TeleportTo(TargetCFrame)
 	local Root = GetRoot()
 	if not Root or not TargetCFrame then
@@ -2727,46 +2792,20 @@ local function TeleportTo(TargetCFrame)
 		return true
 	end
 
-	if Settings.TeleportMode == "Instant (Lompat)" then
-		return StepTo(TargetCFrame, Token)
-	end
-
 	if Settings.TeleportMode == "Jalan (Aman)" then
 		return WalkTo(TargetCFrame, Token)
 	end
 
-	if Settings.TeleportMode == "Tween" then
-		local Distance = (Root.Position - TargetCFrame.Position).Magnitude
-		local Duration = math.max(Distance / math.max(Settings.TweenSpeed, 1), 0.05)
-
-		local Hold = RunService.Heartbeat:Connect(function()
-			if Root.Parent then
-				Root.AssemblyLinearVelocity = Vector3.zero
-			end
-		end)
-
-		ActiveTween = TweenService:Create(Root, TweenInfo.new(Duration, Enum.EasingStyle.Linear), {
-			CFrame = TargetCFrame,
-		})
-		ActiveTween:Play()
-		ActiveTween.Completed:Wait()
-		ActiveTween = nil
-		Hold:Disconnect()
-	else
-		Root.CFrame = TargetCFrame
-
-		-- Cek apakah server menarik balik karakter (anti-cheat)
-		task.delay(1.5, function()
-			if Token == MoveToken and Root.Parent and (Root.Position - TargetCFrame.Position).Magnitude > 25 then
-				if PullBackWarning then
-					PullBackWarning()
-				end
-			end
-		end)
+	-- "Instant (Lynx)": dekat = lompat kecil, jauh = respawn teleport
+	local Distance = (Root.Position - TargetCFrame.Position).Magnitude
+	if Distance <= Settings.ShortRange then
+		return StepTo(TargetCFrame, Token)
 	end
-
-	Root.AssemblyLinearVelocity = Vector3.zero
-	return Token == MoveToken
+	if IsCarrying() then
+		-- Jangan mati saat membawa hewan; jalan biasa (tidak dideteksi)
+		return WalkTo(TargetCFrame, Token)
+	end
+	return RespawnTo(TargetCFrame, Token)
 end
 
 -- Berdiri di atas tanah pada posisi `Pos`, menghadap `LookAt`
@@ -2791,7 +2830,11 @@ local function Notify(Title, Content)
 end
 
 PullBackWarning = function()
-	Notify("Anti-cheat", string.format("Ditarik balik server. Jarak lompat dikecilkan ke %d stud.", Settings.StepSize))
+	Notify("Anti-cheat", "Lompat ditarik balik server, gerakan dihentikan supaya tidak diledakkan.")
+end
+
+MoveNotify = function(Text)
+	Notify("Anti-cheat", Text)
 end
 
 ---------------------------------------------------------------------
@@ -3427,12 +3470,12 @@ FarmSection:AddToggle({
 
 FarmSection:AddDropdown({
 	Title = "Farm Mode",
-	Content = "Instant (Lompat) = cepat seperti Lynx. Jalan = paling pelan",
+	Content = "Instant (Lynx) = dekat lompat, jauh respawn teleport. Jalan = pelan",
 	Multi = false,
-	Options = { "Instant (Lompat)", "Jalan (Aman)", "Tween" },
-	Default = { "Instant (Lompat)" },
+	Options = { "Instant (Lynx)", "Jalan (Aman)" },
+	Default = { "Instant (Lynx)" },
 	Callback = function(Value)
-		Settings.TeleportMode = Value and Value[1] or "Instant (Lompat)"
+		Settings.TeleportMode = Value and Value[1] or "Instant (Lynx)"
 	end,
 })
 
@@ -3773,13 +3816,25 @@ local TpSection = SettingTab:AddSection("Teleport", true)
 
 TpSection:AddSlider({
 	Title = "Jarak Lompat per Frame",
-	Content = "Mode Instant (Lompat). Lynx ~28. Dikecilkan otomatis kalau ditarik balik",
+	Content = "Untuk jarak dekat. Lynx ~28 stud",
 	Increment = 1,
 	Min = 8,
 	Max = 45,
 	Default = Settings.StepSize,
 	Callback = function(Value)
 		Settings.StepSize = Value
+	end,
+})
+
+TpSection:AddSlider({
+	Title = "Batas Jarak Dekat (stud)",
+	Content = "Lebih jauh dari ini = respawn teleport",
+	Increment = 10,
+	Min = 50,
+	Max = 400,
+	Default = Settings.ShortRange,
+	Callback = function(Value)
+		Settings.ShortRange = Value
 	end,
 })
 
@@ -3792,18 +3847,6 @@ TpSection:AddSlider({
 	Default = 10,
 	Callback = function(Value)
 		Settings.WalkMultiplier = Value / 10
-	end,
-})
-
-TpSection:AddSlider({
-	Title = "Kecepatan Tween",
-	Content = "Stud per detik (mode Tween)",
-	Increment = 10,
-	Min = 50,
-	Max = 1000,
-	Default = Settings.TweenSpeed,
-	Callback = function(Value)
-		Settings.TweenSpeed = Value
 	end,
 })
 
@@ -3974,12 +4017,18 @@ local function BankViaGuard()
 	local Started = os.clock()
 
 	-- 1. Lompat ke arah guard sampai ditangkap
+	local Expected = nil
 	while Farm.Enabled and Token == MoveToken and Fling.Count == StartFlings and os.clock() - Started < 8 do
 		local GuardPos = GuardPosition(Guard)
 		local R, Hum = GetRoot(), GetHumanoid()
 		if not GuardPos or not R or not Hum then
 			break
 		end
+		if Expected and (R.Position - Expected).Magnitude > 40 and Fling.Count == StartFlings then
+			LastMoveProblem = "Lompat ke guard ditarik balik"
+			return false
+		end
+		Expected = nil
 		local Flat = Vector3.new(GuardPos.X - R.Position.X, 0, GuardPos.Z - R.Position.Z)
 		if Flat.Magnitude > 2 then
 			local Next = R.Position + Flat.Unit * math.min(Flat.Magnitude - 1, Settings.StepSize)
@@ -3987,6 +4036,7 @@ local function BankViaGuard()
 			local NewPos = Vector3.new(Next.X, Ground.Y + Hum.HipHeight + R.Size.Y / 2, Next.Z)
 			R.CFrame = CFrame.lookAt(NewPos, NewPos + Flat.Unit)
 			R.AssemblyLinearVelocity = Vector3.zero
+			Expected = NewPos
 		end
 		RunService.Heartbeat:Wait()
 	end
@@ -4039,66 +4089,140 @@ local function Bank()
 	BankAndPlace()
 end
 
--- Auto farm
-task.spawn(function()
-	local Skip = setmetatable({}, { __mode = "k" })
+-- Auto farm: satu langkah per panggilan, dibungkus pcall supaya error terlihat
+local LastFarmError = nil
+local FarmSkip = setmetatable({}, { __mode = "k" })
 
+local function FarmStep()
+	if IsJailed() then
+		SetStatus("Sedang ditahan, menunggu...")
+		task.wait(1)
+		return
+	end
+
+	-- Satchel penuh -> setor
+	if Farm.ReturnWhenFull and CarryCount() >= SatchelCapacity() then
+		Bank()
+		return
+	end
+
+	local Egg = PickFarmEgg(FarmSkip)
+	if not Egg then
+		if Farm.ReturnWhenFull and CarryCount() > 0 then
+			Bank()
+			return
+		end
+		SetStatus("Menunggu telur yang cocok...")
+		table.clear(FarmSkip)
+		task.wait(1)
+		return
+	end
+
+	local Label = string.format("%s (%s)", Egg.Name, ZoneName(Egg.ZoneId))
+	SetStatus("Menuju " .. Label)
+
+	if Distance(Egg) > 10 and not TeleportToEgg(Egg) then
+		-- Gagal sampai (ditarik balik / dibatalkan): jangan dipaksa, coba telur lain
+		FarmSkip[Egg.Model] = true
+		SetStatus("Gagal menuju " .. Label .. " (" .. tostring(LastMoveProblem or "?") .. ")")
+		task.wait(2)
+		return
+	end
+
+	local Started, Retries = os.clock(), 0
+	while Farm.Enabled and not Library.Unloaded and EggAlive(Egg) and not IsJailed() do
+		if os.clock() - Started > Farm.MaxTimePerEgg then
+			FarmSkip[Egg.Model] = true
+			break
+		end
+
+		-- Terpental (guard / dorongan) -> dekati lagi, maksimal 3x
+		if Distance(Egg) > 12 then
+			Retries += 1
+			if Retries > 3 or not TeleportToEgg(Egg) then
+				FarmSkip[Egg.Model] = true
+				break
+			end
+		end
+
+		SetStatus(string.format("Memukul %s | bawa %d/%d", Label, CarryCount(), SatchelCapacity()))
+		HitEgg(Egg)
+		task.wait(Farm.HitDelay)
+	end
+end
+
+task.spawn(function()
 	while not Library.Unloaded do
 		if not Farm.Enabled then
 			task.wait(0.3)
-			continue
-		end
-
-		if IsJailed() then
-			SetStatus("Sedang ditahan, menunggu...")
-			task.wait(1)
-			continue
-		end
-
-		-- Satchel penuh -> pulang ke base supaya hewan tersimpan
-		if Farm.ReturnWhenFull and CarryCount() >= SatchelCapacity() then
-			Bank()
-			continue
-		end
-
-		local Egg = PickFarmEgg(Skip)
-		if not Egg then
-			-- Tidak ada telur cocok: setor dulu hewan yang sedang dibawa
-			if Farm.ReturnWhenFull and CarryCount() > 0 then
-				Bank()
-				continue
+		else
+			local ok, Err = pcall(FarmStep)
+			if not ok then
+				LastFarmError = tostring(Err)
+				SetStatus("Error: " .. LastFarmError)
+				warn("[RapHub] Auto farm error: " .. LastFarmError)
+				task.wait(2)
 			end
-			SetStatus("Menunggu telur yang cocok...")
-			table.clear(Skip)
-			task.wait(1)
-			continue
-		end
-
-		local Label = string.format("%s (%s)", Egg.Name, ZoneName(Egg.ZoneId))
-		SetStatus("Menuju " .. Label)
-
-		if Distance(Egg) > 10 then
-			TeleportToEgg(Egg)
-		end
-
-		local Started = os.clock()
-		while Farm.Enabled and not Library.Unloaded and EggAlive(Egg) and not IsJailed() do
-			if os.clock() - Started > Farm.MaxTimePerEgg then
-				Skip[Egg.Model] = true
-				break
-			end
-
-			-- Terpental (guard / dorongan) -> dekati lagi
-			if Distance(Egg) > 12 then
-				SetStatus("Menuju " .. Label)
-				TeleportToEgg(Egg)
-			end
-
-			SetStatus(string.format("Memukul %s | bawa %d/%d", Label, CarryCount(), SatchelCapacity()))
-			HitEgg(Egg)
-			task.wait(Farm.HitDelay)
 		end
 	end
 end)
+
+-- ===================== Diagnosa (tab Settings) =====================
+local DiagSection = SettingTab:AddSection("Diagnosa", true)
+
+local DiagInfo = DiagSection:AddParagraph({
+	Title = "Status sistem",
+	Content = "Tekan Cek Sekarang",
+})
+
+local function DiagnoseText()
+	local Parts = {}
+	local function Check(Label, Ok)
+		table.insert(Parts, Label .. ": " .. (Ok and "OK" or "GAGAL"))
+	end
+
+	local Pick = GameModule("PickaxeController")
+	Check("PickaxeController", Pick ~= nil and type(Pick.Swing) == "function")
+	local AnimalCtl = GameModule("AnimalToolController")
+	Check("AnimalToolController", AnimalCtl ~= nil and type(AnimalCtl.PlaceAt) == "function")
+	Check("fireproximityprompt", type(fireproximityprompt) == "function")
+	Check("Pickaxe", GetPickaxe() ~= nil)
+	Check("Base", MyPlot() ~= nil)
+	Check("SafeZone", SafeSpot() ~= nil)
+	table.insert(Parts, "Telur: " .. #CollectEggs())
+	table.insert(Parts, "Bawa: " .. CarryCount() .. "/" .. SatchelCapacity())
+	table.insert(Parts, "Masalah gerak: " .. tostring(LastMoveProblem or "-"))
+	table.insert(Parts, "Error farm: " .. tostring(LastFarmError or "-"))
+	return table.concat(Parts, " | ")
+end
+
+DiagSection:AddButton({
+	Title = "Cek Sekarang",
+	Content = "Screenshot hasilnya kalau ada yang tidak jalan",
+	Callback = function()
+		local ok, Text = pcall(DiagnoseText)
+		DiagInfo:Set({ Title = "Status sistem", Content = ok and Text or ("Error cek: " .. tostring(Text)) })
+	end,
+})
+
+DiagSection:AddButton({
+	Title = "Tes Pukul Telur Terdekat",
+	Content = "Sekali pukul telur terdekat (harus berdiri di dekat telur)",
+	Callback = function()
+		local Best, BestDist = nil, math.huge
+		for _, Egg in ipairs(CollectEggs()) do
+			local Dist = Distance(Egg)
+			if Dist < BestDist then
+				Best, BestDist = Egg, Dist
+			end
+		end
+		if not Best then
+			Notify("Tes", "Tidak ada telur.")
+			return
+		end
+		HitEgg(Best)
+		Notify("Tes", string.format("Pukul %s (jarak %.1f stud). Lihat HP telurnya turun atau tidak.", Best.Name, BestDist))
+	end,
+})
 
 Notify("Loaded", "Break and Steal an Egg siap dipakai!")
