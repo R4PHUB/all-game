@@ -2454,6 +2454,9 @@ local Steal = {
 	Rarities = {}, -- kosong = semua
 	MinWeight = 0, -- kg
 	MutationOnly = false, -- hanya yang punya mutasi
+	Zones = {}, -- zona tempat mencuri, kosong = semua
+	StreamScan = true, -- minta isi zona jauh dikirim server (tanpa ke sana)
+	Patrol = false, -- kalau kosong, keliling zona pakai respawn teleport
 }
 
 -- Farm atau steal sedang aktif
@@ -3613,6 +3616,35 @@ StealSection:AddToggle({
 	end,
 })
 
+StealSection:AddDropdown({
+	Title = "Zones (kosong = semua)",
+	Content = "Zona tempat mencuri",
+	Multi = true,
+	Options = table.clone(ZoneNameOptions),
+	Default = {},
+	Callback = function(Value)
+		Steal.Zones = Value or {}
+	end,
+})
+
+StealSection:AddToggle({
+	Title = "Pindai Zona Jauh",
+	Content = "Minta server mengirim isi zona jauh supaya hewannya terlihat (tanpa ke sana)",
+	Default = true,
+	Callback = function(Value)
+		Steal.StreamScan = Value
+	end,
+})
+
+StealSection:AddToggle({
+	Title = "Patroli Zona",
+	Content = "Kalau tidak ada target, keliling zona (respawn teleport) untuk mencari hewan",
+	Default = false,
+	Callback = function(Value)
+		Steal.Patrol = Value
+	end,
+})
+
 -- ===================== Main: Taruh Hewan =====================
 local AnimalSection = MainTab:AddSection("Taruh Hewan di Base", false)
 
@@ -4047,15 +4079,21 @@ local function FindGuard(ZoneId)
 	return Best
 end
 
-local function FirePrompt(Prompt)
-	if fireproximityprompt and pcall(fireproximityprompt, Prompt) then
-		return
+-- Tekan prompt. Attempt ganjil = fireproximityprompt, genap = tahan manual
+-- (beberapa executor punya fireproximityprompt yang tidak bekerja di game ini)
+local function FirePrompt(Prompt, Attempt)
+	Attempt = Attempt or 1
+	if Attempt % 2 == 1 and fireproximityprompt then
+		if pcall(fireproximityprompt, Prompt) then
+			return "fireproximityprompt"
+		end
 	end
-	pcall(function()
+	local ok = pcall(function()
 		Prompt:InputHoldBegin()
 		task.wait(Prompt.HoldDuration + 0.05)
 		Prompt:InputHoldEnd()
 	end)
+	return ok and "InputHold" or "gagal"
 end
 
 -- Prompt hewan yang terjatuh (PromptAnchor muncul di dekat karakter saat ditangkap)
@@ -4195,7 +4233,59 @@ local function PromptPosition(Prompt)
 	return nil
 end
 
--- Info hewan: atribut dari prompt & leluhurnya, cadangan ObjectText prompt
+-- Nama tampilan hewan -> rarity, dari modul game ReplicatedStorage.Shared.EggRewards
+local AnimalRarity = nil
+local function GetAnimalRarity()
+	if AnimalRarity then
+		return AnimalRarity
+	end
+	AnimalRarity = {}
+	local EggRewards = SafeRequire(Shared, "EggRewards")
+	if EggRewards and type(EggRewards.Pool) == "table" then
+		for _, Entry in ipairs(EggRewards.Pool) do
+			if type(Entry) == "table" and Entry.Name and Entry.Rarity then
+				local Display = Entry.Name
+				if type(EggRewards.DisplayName) == "function" then
+					local ok, Result = pcall(EggRewards.DisplayName, Entry.Name)
+					if ok and type(Result) == "string" then
+						Display = Result
+					end
+				end
+				AnimalRarity[Display:lower()] = Entry.Rarity
+				AnimalRarity[Entry.Name:lower()] = Entry.Rarity
+			end
+		end
+	end
+	return AnimalRarity
+end
+
+-- ObjectText: '<font color="#4FE8D2"><b>[360Kg]</b></font> Gold Fangtooth Fish'
+-- -> berat 360, nama "Fangtooth Fish", mutasi "Gold", rarity dari EggRewards
+local function ParseObjectText(Text)
+	local Plain = Text:gsub("<[^>]->", "")
+	local WeightText = Plain:match("%[([^%]]+)%]")
+	local Weight = WeightText and ParseShort((WeightText:gsub("[Kk][Gg]", ""))) or nil
+	local Name = Plain:gsub("%b[]", ""):gsub("^%s+", ""):gsub("%s+$", "")
+
+	local Lookup = GetAnimalRarity()
+	local Rarity, Mutation = Lookup[Name:lower()], nil
+	if not Rarity then
+		-- Coba buang kata depan (mutasi), mis. "Gold Fangtooth Fish"
+		local Words = Name:split(" ")
+		for Cut = 1, math.min(2, #Words - 1) do
+			local Rest = table.concat(Words, " ", Cut + 1)
+			if Lookup[Rest:lower()] then
+				Rarity = Lookup[Rest:lower()]
+				Mutation = table.concat(Words, " ", 1, Cut)
+				Name = Rest
+				break
+			end
+		end
+	end
+	return Name, Weight, Rarity, Mutation
+end
+
+-- Info hewan: atribut (kalau ada) + isi teks prompt
 local function PromptInfo(Prompt)
 	local Info = {}
 	local Node = Prompt
@@ -4210,7 +4300,12 @@ local function PromptInfo(Prompt)
 		end
 		Node = Node.Parent
 	end
-	Info.Name = Info.AnimalName or (Prompt.ObjectText ~= "" and Prompt.ObjectText) or "Hewan"
+
+	local Name, Weight, Rarity, Mutation = ParseObjectText(Prompt.ObjectText or "")
+	Info.Name = Info.AnimalName or (Name ~= "" and Name) or "Hewan"
+	Info.WeightKg = Info.WeightKg or Weight
+	Info.Rarity = Info.Rarity or Rarity or GetAnimalRarity()[Info.Name:lower()]
+	Info.Mutation = Info.Mutation or Mutation
 	return Info
 end
 
@@ -4252,6 +4347,25 @@ end
 
 local StealSkip = setmetatable({}, { __mode = "k" })
 
+-- ZoneId dari posisi (pakai ZoneHitboxes)
+local function ZoneIdAt(Pos)
+	local Build = GetBuild()
+	local Hitboxes = Build and Build:FindFirstChild("ZoneHitboxes")
+	if not Hitboxes then
+		return nil
+	end
+	for _, Box in ipairs(Hitboxes:GetChildren()) do
+		if Box:IsA("BasePart") and tonumber(Box.Name) then
+			local Rel = Box.CFrame:PointToObjectSpace(Pos)
+			local Half = Box.Size / 2
+			if math.abs(Rel.X) <= Half.X and math.abs(Rel.Z) <= Half.Z then
+				return "Zone" .. Box.Name
+			end
+		end
+	end
+	return nil
+end
+
 local function StealTargets()
 	local List = {}
 	local Root = GetRoot()
@@ -4263,7 +4377,12 @@ local function StealTargets()
 			local InBase = Plots ~= nil and Prompt:IsDescendantOf(Plots)
 			if (InBase and Steal.OtherBases) or (not InBase and Steal.Dropped) then
 				local Pos = PromptPosition(Prompt)
-				if Pos then
+				local ZoneOk = true
+				if Pos and #Steal.Zones > 0 then
+					local ZoneId = ZoneIdAt(Pos)
+					ZoneOk = ZoneId ~= nil and table.find(Steal.Zones, ZoneName(ZoneId)) ~= nil
+				end
+				if Pos and ZoneOk then
 					local Info = PromptInfo(Prompt)
 					if StealFilter(Info) then
 						Info.Prompt = Prompt
@@ -4283,29 +4402,117 @@ local function StealTargets()
 	return List
 end
 
+local LastStealResult = "-"
+
 -- Datangi prompt, tekan sampai hewan terbawa (CarryCount naik)
 local function StealOne(Info)
-	SetStatus("Mencuri " .. Info.Name .. (Info.Rarity and (" [" .. tostring(Info.Rarity) .. "]") or ""))
+	local Label = Info.Name .. (Info.Rarity and (" [" .. tostring(Info.Rarity) .. "]") or "")
+	SetStatus("Mencuri " .. Label)
 	local Before = CarryCount()
 
-	if Info.Distance > 8 then
-		if not TeleportTo(StandAt(Info.Position, Info.Position)) then
+	-- Berdiri tepat di titik prompt (jangkauan prompt hanya ~10 stud)
+	local Anchor = Info.Prompt.Parent
+	local Target = (Anchor and Anchor:IsA("BasePart")) and Anchor.Position or Info.Position
+	if Info.Distance > 5 then
+		if not TeleportTo(StandAt(Target, Target)) then
 			StealSkip[Info.Prompt] = true
+			LastStealResult = "Gagal sampai ke " .. Label .. " (" .. tostring(LastMoveProblem or "?") .. ")"
 			return false
 		end
 	end
 
-	local Started = os.clock()
-	while os.clock() - Started < 3 and CarryCount() <= Before and Info.Prompt.Parent do
-		FirePrompt(Info.Prompt)
-		task.wait(0.15)
+	local Started, Attempt, Method = os.clock(), 0, "-"
+	while os.clock() - Started < 3 and CarryCount() <= Before and Info.Prompt.Parent and Info.Prompt.Enabled do
+		Attempt += 1
+		Method = FirePrompt(Info.Prompt, Attempt)
+		task.wait(0.2)
 	end
 
 	if CarryCount() > Before then
+		LastStealResult = "Berhasil: " .. Label .. " (" .. Method .. ")"
 		return true
 	end
+
+	local Root = GetRoot()
+	LastStealResult = string.format(
+		"Gagal ambil %s | percobaan %d | metode %s | jarak %.1f | prompt %s",
+		Label,
+		Attempt,
+		Method,
+		Root and (Target - Root.Position).Magnitude or -1,
+		Info.Prompt.Parent and (Info.Prompt.Enabled and "aktif" or "nonaktif") or "hilang"
+	)
 	StealSkip[Info.Prompt] = true
 	return false
+end
+
+---------------------------------------------------------------------
+-- Zona jauh: minta server mengirim isi zona (streaming) tanpa ke sana
+---------------------------------------------------------------------
+local function ZoneScanPoints()
+	local Points = {}
+	local Build = GetBuild()
+	local Hitboxes = Build and Build:FindFirstChild("ZoneHitboxes")
+	if not Hitboxes then
+		return Points
+	end
+	for _, Box in ipairs(Hitboxes:GetChildren()) do
+		local Index = tonumber(Box.Name)
+		if Box:IsA("BasePart") and Index then
+			local ZoneId = "Zone" .. Index
+			if #Steal.Zones == 0 or table.find(Steal.Zones, ZoneName(ZoneId)) then
+				-- Titik tiap ~200 stud sepanjang zona
+				local Count = math.max(1, math.ceil(Box.Size.X / 200))
+				for i = 1, Count do
+					local X = Box.Position.X - Box.Size.X / 2 + (i - 0.5) * (Box.Size.X / Count)
+					table.insert(Points, { ZoneId = ZoneId, Position = Vector3.new(X, 5, Box.Position.Z) })
+				end
+			end
+		end
+	end
+	return Points
+end
+
+task.spawn(function()
+	while not Library.Unloaded do
+		if Steal.Enabled and Steal.StreamScan then
+			for _, Point in ipairs(ZoneScanPoints()) do
+				if not Steal.Enabled or Library.Unloaded then
+					break
+				end
+				pcall(function()
+					Player:RequestStreamAroundAsync(Point.Position, 2)
+				end)
+				task.wait(0.4)
+			end
+		end
+		task.wait(2)
+	end
+end)
+
+-- Patroli: kalau tidak ada target terlihat, datangi zona satu per satu
+local PatrolIndex = 0
+local function PatrolNextZone()
+	local Zones = {}
+	for _, ZoneId in ipairs(GetZoneList()) do
+		if #Steal.Zones == 0 or table.find(Steal.Zones, ZoneName(ZoneId)) then
+			table.insert(Zones, ZoneId)
+		end
+	end
+	if #Zones == 0 then
+		return
+	end
+	PatrolIndex = PatrolIndex % #Zones + 1
+	local ZoneId = Zones[PatrolIndex]
+	SetStatus("Patroli ke " .. ZoneName(ZoneId) .. " mencari hewan...")
+	local Previous = Settings.ZoneTarget
+	Settings.ZoneTarget = "Tengah Zona"
+	local Target = ZoneTargetCFrame(ZoneId)
+	Settings.ZoneTarget = Previous
+	if Target then
+		TeleportTo(Target)
+		task.wait(1.5) -- beri waktu isi zona termuat
+	end
 end
 
 -- Info jumlah target curi
@@ -4357,7 +4564,11 @@ local function FarmStep()
 			Bank()
 			return
 		end
-		SetStatus("Menunggu hewan untuk dicuri...")
+		if Steal.Patrol then
+			PatrolNextZone()
+			return
+		end
+		SetStatus("Menunggu hewan untuk dicuri... (" .. LastStealResult .. ")")
 		task.wait(0.5)
 		return
 	end
@@ -4449,6 +4660,8 @@ local function DiagnoseText()
 	table.insert(Parts, "Bawa: " .. CarryCount() .. "/" .. SatchelCapacity())
 	table.insert(Parts, "Masalah gerak: " .. tostring(LastMoveProblem or "-"))
 	table.insert(Parts, "Error farm: " .. tostring(LastFarmError or "-"))
+	table.insert(Parts, "Curi terakhir: " .. LastStealResult)
+	table.insert(Parts, "StreamingEnabled: " .. tostring(workspace.StreamingEnabled))
 	return table.concat(Parts, " | ")
 end
 
@@ -4478,6 +4691,28 @@ DiagSection:AddButton({
 		end
 		HitEgg(Best)
 		Notify("Tes", string.format("Pukul %s (jarak %.1f stud). Lihat HP telurnya turun atau tidak.", Best.Name, BestDist))
+	end,
+})
+
+DiagSection:AddButton({
+	Title = "Tes Curi Terdekat",
+	Content = "Curi 1 hewan terdekat tanpa filter, lalu tampilkan hasilnya",
+	Callback = function()
+		local Saved = { Rarities = Steal.Rarities, MinWeight = Steal.MinWeight, MutationOnly = Steal.MutationOnly, Zones = Steal.Zones }
+		Steal.Rarities, Steal.MinWeight, Steal.MutationOnly, Steal.Zones = {}, 0, false, {}
+		table.clear(StealSkip)
+		local Target = StealTargets()[1]
+		Steal.Rarities, Steal.MinWeight, Steal.MutationOnly, Steal.Zones = Saved.Rarities, Saved.MinWeight, Saved.MutationOnly, Saved.Zones
+
+		if not Target then
+			LastStealResult = "Tidak ada StealPrompt terlihat (total: " .. #AllStealPrompts() .. ")"
+		else
+			StealOne(Target)
+		end
+		Notify("Tes Curi", LastStealResult)
+		pcall(function()
+			DiagInfo:Set({ Title = "Status sistem", Content = DiagnoseText() })
+		end)
 	end,
 })
 
