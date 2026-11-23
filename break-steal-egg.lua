@@ -61,71 +61,102 @@ local function GetGuiParent()
 	return Player:WaitForChild("PlayerGui")
 end
 
-local function OpenClose()
-	local ScreenGui = Custom:Create(
-		"ScreenGui",
-		{
-			ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
-		},
-		GetGuiParent()
-	)
+-- Logo tombol buka panel (muncul saat panel di-minimize).
+-- Ganti dengan asset ID gambar logo bulat kamu, contoh: "rbxassetid://1234567890"
+Custom.LogoImage = "rbxassetid://117841126878884"
 
-	local Close_ImageButton = Custom:Create("ImageButton", {
-		BackgroundColor3 = Color3.fromRGB(0, 0, 0),
-		BorderColor3 = Custom.ColorRGB,
-		BackgroundTransparency = 1,
-		Position = UDim2.new(0.1021, 0, 0.0743, 0),
-		Size = UDim2.new(0, 59, 0, 49),
-		Image = "rbxassetid://117841126878884",
+-- Hapus panel lama kalau script dieksekusi ulang
+local Env = (getgenv and getgenv()) or _G
+if type(Env.RapHubCleanup) == "function" then
+	pcall(Env.RapHubCleanup)
+end
+local CreatedGuis = {}
+
+local function OpenClose()
+	local ScreenGui = Custom:Create("ScreenGui", {
+		Name = "RapHubToggle",
+		ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+		ResetOnSpawn = false,
+		DisplayOrder = 999,
+	}, GetGuiParent())
+	table.insert(CreatedGuis, ScreenGui)
+
+	local Button = Custom:Create("ImageButton", {
+		Name = "OpenButton",
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		BackgroundColor3 = Custom.Dark,
+		BorderSizePixel = 0,
+		Position = UDim2.new(0, 80, 0, 100),
+		Size = UDim2.new(0, 56, 0, 56),
+		Image = Custom.LogoImage,
+		ScaleType = Enum.ScaleType.Crop,
+		AutoButtonColor = false,
 		Visible = false,
 	}, ScreenGui)
 
-	local UICorner = Custom:Create("UICorner", {
-		Name = "MainCorner",
-		CornerRadius = UDim.new(0, 9),
-	}, Close_ImageButton)
+	Custom:Create("UICorner", { CornerRadius = UDim.new(1, 0) }, Button)
+	Custom:Create("UIStroke", { Color = Custom.ColorRGB, Thickness = 2.5 }, Button)
 
-	local dragging, dragStart, startPos = false, nil, nil
+	-- Huruf cadangan kalau gambar logo gagal dimuat
+	local Fallback = Custom:Create("TextLabel", {
+		BackgroundTransparency = 1,
+		Size = UDim2.fromScale(1, 1),
+		Font = Enum.Font.GothamBlack,
+		Text = "R",
+		TextColor3 = Custom.ColorRGB,
+		TextSize = 28,
+		Visible = false,
+	}, Button)
 
-	local function UpdateDraggable(input)
-		local delta = input.Position - dragStart
-		Close_ImageButton.Position =
-			UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
-	end
+	task.spawn(function()
+		pcall(function()
+			game:GetService("ContentProvider"):PreloadAsync({ Button })
+		end)
+		Fallback.Visible = not Button.IsLoaded
+	end)
 
-	Close_ImageButton.InputBegan:Connect(function(input)
+	-- Bisa digeser; geser tidak dianggap klik
+	local Dragging, DragStart, StartPos, Moved = false, nil, nil, false
+
+	Button.InputBegan:Connect(function(input)
 		if
-			input.UserInputType == Enum.UserInputType.Touch
-			or input.UserInputType == Enum.UserInputType.MouseButton1
+			input.UserInputType == Enum.UserInputType.MouseButton1
+			or input.UserInputType == Enum.UserInputType.Touch
 		then
-			dragging = true
-			dragStart = input.Position
-			startPos = Close_ImageButton.Position
+			Dragging, Moved = true, false
+			DragStart, StartPos = input.Position, Button.Position
 
 			input.Changed:Connect(function()
 				if input.UserInputState == Enum.UserInputState.End then
-					dragging = false
+					Dragging = false
 				end
 			end)
 		end
 	end)
 
-	Close_ImageButton.InputChanged:Connect(function(input)
+	UserInputService.InputChanged:Connect(function(input)
 		if
-			dragging
+			Dragging
 			and (
 				input.UserInputType == Enum.UserInputType.MouseMovement
 				or input.UserInputType == Enum.UserInputType.Touch
 			)
 		then
-			UpdateDraggable(input)
+			local Delta = input.Position - DragStart
+			if Delta.Magnitude > 6 then
+				Moved = true
+			end
+			Button.Position =
+				UDim2.new(StartPos.X.Scale, StartPos.X.Offset + Delta.X, StartPos.Y.Scale, StartPos.Y.Offset + Delta.Y)
 		end
 	end)
 
-	return Close_ImageButton
+	return Button, function()
+		return Moved
+	end
 end
 
-local Open_Close = OpenClose()
+local Open_Close, OpenCloseWasDragged = OpenClose()
 
 local function MakeDraggable(topbarobject, object)
 	local dragging, dragStart, startPos = false, nil, nil
@@ -207,238 +238,181 @@ function CircleClick(Button, X, Y)
 	end)
 end
 
-local Speed_Library, Notification = {}, {}
+local Speed_Library = {}
 
 Speed_Library.Unloaded = false
+
+Env.RapHubCleanup = function()
+	Speed_Library.Unloaded = true
+	for _, Gui in ipairs(CreatedGuis) do
+		pcall(function()
+			Gui:Destroy()
+		end)
+	end
+end
+
+-- /// Notifikasi (tumpuk di kanan bawah, hilang otomatis setelah Delay detik)
+
+local NotifyHolder
+local NotifyCount = 0
+
+local function GetNotifyHolder()
+	if NotifyHolder and NotifyHolder.Parent then
+		return NotifyHolder
+	end
+
+	local Gui = Custom:Create("ScreenGui", {
+		Name = "RapHubNotify",
+		ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+		ResetOnSpawn = false,
+		DisplayOrder = 1000,
+	}, GetGuiParent())
+	table.insert(CreatedGuis, Gui)
+
+	NotifyHolder = Custom:Create("Frame", {
+		AnchorPoint = Vector2.new(1, 1),
+		BackgroundTransparency = 1,
+		Position = UDim2.new(1, -20, 1, -20),
+		Size = UDim2.new(0, 300, 1, -40),
+		Name = "NotificationLayout",
+	}, Gui)
+
+	Custom:Create("UIListLayout", {
+		SortOrder = Enum.SortOrder.LayoutOrder,
+		VerticalAlignment = Enum.VerticalAlignment.Bottom,
+		Padding = UDim.new(0, 8),
+	}, NotifyHolder)
+
+	return NotifyHolder
+end
 
 function Speed_Library:SetNotification(Config)
 	local Title = Config[1] or Config.Title or ""
 	local Description = Config[2] or Config.Description or ""
 	local Content = Config[3] or Config.Content or ""
-	local Time = Config[5] or Config.Time or 0.5
-	local Delay = Config[6] or Config.Delay or 5
+	local Time = tonumber(Config[5] or Config.Time) or 0.35
+	local Delay = tonumber(Config[6] or Config.Delay) or 3
 
-	local NotificationGui = Custom:Create(
-		"ScreenGui",
-		{
-			ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
-		},
-		GetGuiParent()
-	)
+	NotifyCount += 1
 
-	local NotificationLayout = Custom:Create("Frame", {
-		AnchorPoint = Vector2.new(1, 1),
-		BackgroundColor3 = Color3.fromRGB(255, 255, 255),
-		BackgroundTransparency = 0.999,
-		BorderColor3 = Color3.fromRGB(0, 0, 0),
-		BorderSizePixel = 0,
-		Position = UDim2.new(1, -30, 1, -30),
-		Size = UDim2.new(0, 320, 1, 0),
-		Name = "NotificationLayout",
-	}, NotificationGui)
-
-	local Count = 0
-
-	NotificationLayout.ChildRemoved:Connect(function()
-		Count = 0
-		local tweenInfo = TweenInfo.new(0.3, Enum.EasingStyle.Quad, Enum.EasingDirection.InOut)
-
-		for _, v in ipairs(NotificationLayout:GetChildren()) do
-			local NewPOS = UDim2.new(0, 0, 1, -((v.Size.Y.Offset + 12) * Count))
-			local tween = TweenService:Create(v, tweenInfo, { Position = NewPOS })
-			tween:Play()
-			Count = Count + 1
-		end
-	end)
-
-	local _Count = 0
-	for _, v in ipairs(NotificationLayout:GetChildren()) do
-		_Count = -v.Position.Y.Offset + v.Size.Y.Offset + 12
-	end
-
-	local NotificationFrame = Custom:Create("Frame", {
-		BackgroundColor3 = Color3.fromRGB(0, 0, 0),
-		BorderColor3 = Color3.fromRGB(0, 0, 0),
-		BorderSizePixel = 0,
-		Size = UDim2.new(1, 0, 0, 150),
+	local Slot = Custom:Create("Frame", {
+		BackgroundTransparency = 1,
+		LayoutOrder = NotifyCount,
+		Size = UDim2.new(1, 0, 0, 60),
 		Name = "NotificationFrame",
-		BackgroundTransparency = 1,
-		AnchorPoint = Vector2.new(0, 1),
-		Position = UDim2.new(0, 0, 1, -_Count),
-	}, NotificationLayout)
+	}, GetNotifyHolder())
 
-	local NotificationFrameReal = Custom:Create("Frame", {
-		BorderColor3 = Color3.fromRGB(0, 0, 0),
-		BorderSizePixel = 0,
-		Position = UDim2.new(0, 400, 0, 0),
-		Size = UDim2.new(1, 0, 1, 0),
-		Name = "NotificationFrameReal",
+	local Card = Custom:Create("Frame", {
 		BackgroundColor3 = Custom.Dark,
-	}, NotificationFrame)
-
-	Custom:Create("UICorner", {
-		CornerRadius = UDim.new(0, 8),
-	}, NotificationFrameReal)
-
-	local DropShadowHolder = Custom:Create("Frame", {
-		BackgroundTransparency = 1,
 		BorderSizePixel = 0,
+		Position = UDim2.new(1, 30, 0, 0),
 		Size = UDim2.new(1, 0, 1, 0),
-		ZIndex = 0,
-		Name = "DropShadowHolder",
-		Parent = NotificationFrameReal,
-	})
+		ClipsDescendants = true,
+		Name = "NotificationFrameReal",
+	}, Slot)
 
-	local DropShadow = Custom:Create("ImageLabel", {
-		Image = "",
-		ImageColor3 = Color3.fromRGB(0, 0, 0),
-		ImageTransparency = 0.5,
-		ScaleType = Enum.ScaleType.Slice,
-		SliceCenter = Rect.new(49, 49, 450, 450),
-		AnchorPoint = Vector2.new(0.5, 0.5),
+	Custom:Create("UICorner", { CornerRadius = UDim.new(0, 8) }, Card)
+	Custom:Create("UIStroke", { Color = Custom.Stroke, Thickness = 1.5 }, Card)
+
+	Custom:Create("Frame", {
+		BackgroundColor3 = Custom.ColorRGB,
+		BorderSizePixel = 0,
+		Position = UDim2.new(0, 8, 0, 10),
+		Size = UDim2.new(0, 3, 1, -20),
+		Name = "Accent",
+	}, Card)
+
+	Custom:Create("TextLabel", {
 		BackgroundTransparency = 1,
-		BorderSizePixel = 0,
-		Position = UDim2.new(0.5, 0, 0.5, 0),
-		Size = UDim2.new(1, 47, 1, 47),
-		ZIndex = 0,
-		Name = "DropShadow",
-		Parent = DropShadowHolder,
-	})
-
-	local Top = Custom:Create("Frame", {
-		BackgroundColor3 = Color3.fromRGB(0, 0, 0),
-		BackgroundTransparency = 0.999,
-		BorderColor3 = Color3.fromRGB(0, 0, 0),
-		BorderSizePixel = 0,
-		Size = UDim2.new(1, 0, 0, 36),
-		Name = "Top",
-		Parent = NotificationFrameReal,
-	})
-
-	local TextLabel = Custom:Create("TextLabel", {
 		Font = Enum.Font.GothamBold,
-		Text = Title,
+		RichText = true,
+		Text = Title .. '  <font color="#' .. Custom.ColorRGB:ToHex() .. '">' .. Description .. "</font>",
 		TextColor3 = Color3.fromRGB(255, 255, 255),
 		TextSize = 14,
 		TextXAlignment = Enum.TextXAlignment.Left,
-		BackgroundColor3 = Color3.fromRGB(255, 255, 255),
-		BackgroundTransparency = 0.999,
-		BorderColor3 = Color3.fromRGB(0, 0, 0),
-		BorderSizePixel = 0,
-		Size = UDim2.new(1, 0, 1, 0),
-		Position = UDim2.new(0, 10, 0, 0),
-		Parent = Top,
-	})
+		Position = UDim2.new(0, 20, 0, 9),
+		Size = UDim2.new(1, -50, 0, 16),
+		Name = "Title",
+	}, Card)
 
-	Custom:Create("UIStroke", {
-		Color = Color3.fromRGB(255, 255, 255),
-		Thickness = 0.3,
-		Parent = TextLabel,
-	})
-
-	Custom:Create("UICorner", {
-		Parent = Top,
-		CornerRadius = UDim.new(0, 5),
-	})
-
-	local TextLabel1 = Custom:Create("TextLabel", {
-		Font = Enum.Font.GothamBold,
-		Text = Description,
-		TextColor3 = Custom.ColorRGB,
-		TextSize = 14,
-		TextXAlignment = Enum.TextXAlignment.Left,
-		BackgroundColor3 = Color3.fromRGB(255, 255, 255),
-		BackgroundTransparency = 0.999,
-		BorderColor3 = Color3.fromRGB(0, 0, 0),
-		BorderSizePixel = 0,
-		Size = UDim2.new(1, 0, 1, 0),
-		Position = UDim2.new(0, TextLabel.TextBounds.X + 15, 0, 0),
-		Parent = Top,
-	})
-
-	Custom:Create("UIStroke", {
-		Color = Custom.ColorRGB,
-		Thickness = 0.4,
-		Parent = TextLabel1,
-	})
-
-	local Close = Custom:Create("TextButton", {
-		Font = Enum.Font.SourceSans,
-		Text = "X",
-		TextColor3 = Color3.fromRGB(255, 255, 255),
-		TextSize = 18,
-		AnchorPoint = Vector2.new(1, 0.5),
-		BackgroundColor3 = Color3.fromRGB(255, 255, 255),
-		BackgroundTransparency = 0.999,
-		BorderColor3 = Color3.fromRGB(0, 0, 0),
-		BorderSizePixel = 0,
-		Position = UDim2.new(1, -5, 0.5, 0),
-		Size = UDim2.new(0, 25, 0, 25),
-		Name = "Close",
-		Parent = Top,
-	})
-
-	local TextLabel2 = Custom:Create("TextLabel", {
-		Font = Enum.Font.GothamBold,
-		TextColor3 = Color3.fromRGB(255, 255, 255),
-		TextSize = 13,
+	local ContentLabel = Custom:Create("TextLabel", {
+		BackgroundTransparency = 1,
+		Font = Enum.Font.GothamMedium,
 		Text = Content,
+		TextColor3 = Color3.fromRGB(180, 170, 200),
+		TextSize = 13,
+		TextWrapped = true,
 		TextXAlignment = Enum.TextXAlignment.Left,
 		TextYAlignment = Enum.TextYAlignment.Top,
-		BackgroundColor3 = Color3.fromRGB(255, 255, 255),
-		BackgroundTransparency = 0.999,
-		TextColor3 = Color3.fromRGB(150, 150, 150),
-		BorderColor3 = Color3.fromRGB(0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		Position = UDim2.new(0, 20, 0, 29),
+		Size = UDim2.new(1, -32, 0, 0),
+		Name = "Content",
+	}, Card)
+
+	local CloseButton = Custom:Create("TextButton", {
+		BackgroundTransparency = 1,
+		Font = Enum.Font.GothamBold,
+		Text = "X",
+		TextColor3 = Color3.fromRGB(200, 200, 200),
+		TextSize = 14,
+		AnchorPoint = Vector2.new(1, 0),
+		Position = UDim2.new(1, -6, 0, 6),
+		Size = UDim2.new(0, 22, 0, 22),
+		Name = "Close",
+	}, Card)
+
+	local Progress = Custom:Create("Frame", {
+		BackgroundColor3 = Custom.ColorRGB,
 		BorderSizePixel = 0,
-		Position = UDim2.new(0, 10, 0, 27),
-		Size = UDim2.new(1, -20, 0, 13),
-		Parent = NotificationFrameReal,
-	})
+		AnchorPoint = Vector2.new(0, 1),
+		Position = UDim2.new(0, 0, 1, 0),
+		Size = UDim2.new(1, 0, 0, 2),
+		Name = "Progress",
+	}, Card)
 
-	TextLabel2.Size = UDim2.new(1, -20, 0, 13 + (13 * (TextLabel2.TextBounds.X // TextLabel2.AbsoluteSize.X)))
-	TextLabel2.TextWrapped = true
-
-	if TextLabel2.AbsoluteSize.Y < 27 then
-		NotificationFrame.Size = UDim2.new(1, 0, 0, 65)
-	else
-		NotificationFrame.Size = UDim2.new(1, 0, 0, TextLabel2.AbsoluteSize.Y + 40)
-	end
-
-	local Waitted = false
-
-	function Notification:Close()
-		if Waitted then
-			return false
+	local Closed = false
+	local function Close()
+		if Closed then
+			return
 		end
-		Waitted = true
+		Closed = true
 
-		local tween = TweenService:Create(
-			NotificationFrameReal,
-			TweenInfo.new(tonumber(Time), Enum.EasingStyle.Back, Enum.EasingDirection.InOut),
-			{ Position = UDim2.new(0, 400, 0, 0) }
+		local Tween = TweenService:Create(
+			Card,
+			TweenInfo.new(Time, Enum.EasingStyle.Quad, Enum.EasingDirection.In),
+			{ Position = UDim2.new(1, 30, 0, 0) }
 		)
-		tween:Play()
-
-		task.wait(tonumber(Time) / 1.2)
-
-		NotificationFrame:Destroy()
-
-		Waitted = false
+		Tween:Play()
+		Tween.Completed:Wait()
+		Slot:Destroy()
 	end
 
-	Close.Activated:Connect(function()
-		Notification:Close()
+	CloseButton.Activated:Connect(function()
+		task.spawn(Close)
 	end)
 
-	TweenService:Create(
-		NotificationFrameReal,
-		TweenInfo.new(tonumber(Time), Enum.EasingStyle.Back, Enum.EasingDirection.InOut),
-		{ Position = UDim2.new(0, 0, 0, 0) }
-	):Play()
-	task.wait(tonumber(Delay))
-	Notification:Close()
+	task.spawn(function()
+		task.wait()
+		Slot.Size = UDim2.new(1, 0, 0, math.max(52, ContentLabel.AbsoluteSize.Y + 40))
 
-	return Notification
+		TweenService:Create(
+			Card,
+			TweenInfo.new(Time, Enum.EasingStyle.Back, Enum.EasingDirection.Out),
+			{ Position = UDim2.new(0, 0, 0, 0) }
+		):Play()
+		TweenService:Create(Progress, TweenInfo.new(Delay, Enum.EasingStyle.Linear), { Size = UDim2.new(0, 0, 0, 2) })
+			:Play()
+
+		task.wait(Delay)
+		Close()
+	end)
+
+	local Handle = {}
+	function Handle:Close()
+		task.spawn(Close)
+	end
+	return Handle
 end
 
 function Speed_Library:CreateWindow(Config)
@@ -449,13 +423,12 @@ function Speed_Library:CreateWindow(Config)
 
 	local Funcs = {}
 
-	local SpeedHubXGui = Custom:Create(
-		"ScreenGui",
-		{
-			ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
-		},
-		GetGuiParent()
-	)
+	local SpeedHubXGui = Custom:Create("ScreenGui", {
+		Name = "RapHub",
+		ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+		ResetOnSpawn = false,
+	}, GetGuiParent())
+	table.insert(CreatedGuis, SpeedHubXGui)
 
 	local DropShadowHolder = Custom:Create("Frame", {
 		BackgroundTransparency = 1,
@@ -689,34 +662,109 @@ function Speed_Library:CreateWindow(Config)
 	ScrollTab.ChildAdded:Connect(UpdateSize)
 	ScrollTab.ChildRemoved:Connect(UpdateSize)
 
+	local function SetMinimized(State)
+		DropShadowHolder.Visible = not State
+		Open_Close.Visible = State
+	end
+
 	Min.Activated:Connect(function()
 		CircleClick(Min, Player:GetMouse().X, Player:GetMouse().Y)
-		DropShadowHolder.Visible = false
-
-		if not Open_Close.Visible then
-			Open_Close.Visible = true
-		end
+		SetMinimized(true)
 	end)
 
 	Open_Close.Activated:Connect(function()
-		DropShadowHolder.Visible = true
-		if Open_Close.Visible then
-			Open_Close.Visible = false
+		if OpenCloseWasDragged() then
+			return
+		end
+		SetMinimized(false)
+	end)
+
+	-- Tombol keyboard RightControl untuk buka/tutup panel
+	UserInputService.InputBegan:Connect(function(input, gameProcessed)
+		if not gameProcessed and input.KeyCode == Enum.KeyCode.RightControl and SpeedHubXGui.Parent then
+			SetMinimized(DropShadowHolder.Visible)
 		end
 	end)
 
 	Close.Activated:Connect(function()
 		CircleClick(Close, Player:GetMouse().X, Player:GetMouse().Y)
-		if SpeedHubXGui then
-			SpeedHubXGui:Destroy()
-		end
-		if not Speed_Library.Unloaded then
-			Speed_Library.Unloaded = true
-		end
+		Env.RapHubCleanup()
 	end)
 
 	DropShadowHolder.Size = UDim2.new(0, 115 + TextLabel.TextBounds.X + 1 + TextLabel1.TextBounds.X, 0, 350)
 	MakeDraggable(Top, DropShadowHolder)
+
+	-- /// Resize (tarik pojok kanan bawah)
+
+	local MinSize = Vector2.new(420, 260)
+
+	local ResizeHandle = Custom:Create("TextButton", {
+		Name = "ResizeHandle",
+		AnchorPoint = Vector2.new(1, 1),
+		BackgroundTransparency = 1,
+		Position = UDim2.new(1, -3, 1, -3),
+		Size = UDim2.fromOffset(18, 18),
+		Text = "",
+		AutoButtonColor = false,
+		ZIndex = 20,
+	}, Main)
+
+	for _, Dot in ipairs({ { 14, 4 }, { 10, 8 }, { 14, 8 }, { 6, 12 }, { 10, 12 }, { 14, 12 } }) do
+		Custom:Create("Frame", {
+			BackgroundColor3 = Custom.ColorRGB,
+			BorderSizePixel = 0,
+			Position = UDim2.fromOffset(Dot[1] - 1, Dot[2] - 1),
+			Size = UDim2.fromOffset(2, 2),
+			ZIndex = 20,
+		}, ResizeHandle)
+	end
+
+	local Resizing, ResizeStart, StartSize, StartHolderPos = false, nil, nil, nil
+
+	ResizeHandle.InputBegan:Connect(function(input)
+		if
+			input.UserInputType == Enum.UserInputType.MouseButton1
+			or input.UserInputType == Enum.UserInputType.Touch
+		then
+			Resizing = true
+			ResizeStart = input.Position
+			StartSize = Vector2.new(Main.Size.X.Offset, Main.Size.Y.Offset)
+			StartHolderPos = DropShadowHolder.Position
+
+			input.Changed:Connect(function()
+				if input.UserInputState == Enum.UserInputState.End then
+					Resizing = false
+				end
+			end)
+		end
+	end)
+
+	UserInputService.InputChanged:Connect(function(input)
+		if
+			Resizing
+			and (
+				input.UserInputType == Enum.UserInputType.MouseMovement
+				or input.UserInputType == Enum.UserInputType.Touch
+			)
+		then
+			local Delta = input.Position - ResizeStart
+			local Viewport = SpeedHubXGui.AbsoluteSize
+
+			local W = math.clamp(StartSize.X + Delta.X, MinSize.X, math.max(MinSize.X, Viewport.X - 20))
+			local H = math.clamp(StartSize.Y + Delta.Y, MinSize.Y, math.max(MinSize.Y, Viewport.Y - 20))
+
+			Main.Size = UDim2.fromOffset(W, H)
+			DropShadow.Size = UDim2.fromOffset(W, H)
+
+			-- Panel berpusat di holder, jadi geser holder setengah perubahan agar pojok kiri atas diam
+			DropShadowHolder.Position = UDim2.new(
+				StartHolderPos.X.Scale,
+				StartHolderPos.X.Offset + (W - StartSize.X) / 2,
+				StartHolderPos.Y.Scale,
+				StartHolderPos.Y.Offset + (H - StartSize.Y) / 2
+			)
+		end
+	end)
 
 	-- /// Blur
 
@@ -2353,15 +2401,14 @@ end)()
 
 --[[
 	RapHub - Break and Steal an Egg
-	Fitur:
-	  - Teleport ke egg yang muncul (pilih manual / terdekat / auto)
-	  - Teleport ke area (Zone1..ZoneN)
+	  - Teleport ke telur (daftar telur yang muncul, terdekat, auto + filter)
+	  - Teleport ke zona (nama asli zona) & lokasi penting (base, mesin)
+	`Library` (UI) ditanam otomatis di atas file ini oleh build.js
 ]]
-
--- `Library` (UI) ditanam otomatis di atas file ini oleh build.js
 
 local Players = game:GetService("Players")
 local TweenService = game:GetService("TweenService")
+local RunService = game:GetService("RunService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local Player = Players.LocalPlayer
@@ -2371,70 +2418,145 @@ local Player = Players.LocalPlayer
 ---------------------------------------------------------------------
 local Settings = {
 	TeleportMode = "Instant", -- "Instant" | "Tween"
-	TweenSpeed = 120, -- stud per detik
-	HeightOffset = 4, -- tinggi di atas target
-	AutoDelay = 1, -- jeda antar teleport (detik) untuk auto
-	AutoPrompt = false, -- otomatis tekan ProximityPrompt di dekat egg
-	EggFilter = {}, -- kosong = semua egg
+	TweenSpeed = 300, -- stud per detik
+	ZoneTarget = "Pintu Masuk", -- "Pintu Masuk" | "Tengah Zona" | "Area Telur"
+	AutoPriority = "Terdekat", -- "Terdekat" | "Luck Tertinggi" | "Terberat"
+	AutoNames = {}, -- kosong = semua telur
+	AutoRarities = {}, -- kosong = semua rarity
+	AutoStayTime = 10, -- detik maksimal di satu telur
 }
 
 ---------------------------------------------------------------------
--- Helper karakter & posisi
+-- Data game (dibaca dari ReplicatedStorage.Shared, ada cadangan)
+---------------------------------------------------------------------
+local ZONE_NAMES = {
+	Zone1 = "Forest Zone",
+	Zone2 = "Desert Zone",
+	Zone3 = "Snowy Zone",
+	Zone4 = "Candy Zone",
+	Zone5 = "Swamp Zone",
+	Zone6 = "Ocean Zone",
+	Zone7 = "Volcano Zone",
+	Zone8 = "Blossom Zone",
+	Zone9 = "Galaxy Zone",
+	Zone10 = "Planet X Zone",
+	Zone11 = "Haunted Graveyard",
+	Zone12 = "Fairy Castle",
+	Zone13 = "Fantasy Expansion",
+	Zone14 = "Mount Olympus",
+	Zone15 = "Pirate Cove",
+}
+
+local RARITY_ORDER = {
+	"Common",
+	"Uncommon",
+	"Rare",
+	"Epic",
+	"Legendary",
+	"Mythic",
+	"Divine",
+	"Cosmic",
+	"Secret",
+	"Celestial",
+	"Inferno",
+	"Void",
+	"Omega",
+	"Spectral",
+	"Ethereal",
+}
+
+local function SafeRequire(Parent, Name)
+	local Module = Parent and Parent:FindFirstChild(Name)
+	if not Module then
+		return nil
+	end
+	local ok, Result = pcall(require, Module)
+	return ok and type(Result) == "table" and Result or nil
+end
+
+local Shared = ReplicatedStorage:FindFirstChild("Shared")
+local ZoneDisplayInfo = SafeRequire(Shared, "ZoneDisplayInfo")
+local ZonesConfig = SafeRequire(Shared, "ZonesConfig")
+
+-- Ambil nama zona dari game kalau bisa
+if ZoneDisplayInfo then
+	for ZoneId, Info in pairs(ZoneDisplayInfo) do
+		if type(Info) == "table" and type(Info.Name) == "string" then
+			ZONE_NAMES[ZoneId] = Info.Name
+		end
+	end
+end
+
+-- Urutan rarity dari ZonesConfig (kalau ada)
+if ZonesConfig and type(ZonesConfig.Zones) == "table" then
+	local List = {}
+	for _, Zone in ipairs(ZonesConfig.Zones) do
+		if type(Zone) == "table" and Zone.Rarity then
+			table.insert(List, Zone.Rarity)
+		end
+	end
+	if #List > 0 then
+		RARITY_ORDER = List
+	end
+end
+
+local function ZoneIndex(ZoneId)
+	return tonumber(tostring(ZoneId):match("%d+")) or 999
+end
+
+local function ZoneName(ZoneId)
+	return ZONE_NAMES[ZoneId] or ZoneId
+end
+
+local SUFFIX = { K = 1e3, M = 1e6, B = 1e9, T = 1e12, Qa = 1e15, Qi = 1e18, Sx = 1e21, Sp = 1e24 }
+local function ParseShort(Text)
+	if type(Text) == "number" then
+		return Text
+	end
+	if type(Text) ~= "string" then
+		return 0
+	end
+	local Num, Suffix = Text:match("([%d%.]+)%s*(%a*)")
+	return (tonumber(Num) or 0) * (SUFFIX[Suffix] or 1)
+end
+
+---------------------------------------------------------------------
+-- Karakter & teleport
 ---------------------------------------------------------------------
 local function GetRoot()
 	local Character = Player.Character
 	return Character and Character:FindFirstChild("HumanoidRootPart")
 end
 
--- Ambil posisi tengah dari Model / BasePart / Folder
-local function GetPosition(Object)
-	if not Object or not Object.Parent then
-		return nil
-	end
-
-	if Object:IsA("BasePart") then
-		return Object.Position
-	end
-
-	if Object:IsA("Model") then
-		local ok, cf = pcall(function()
-			return Object:GetPivot()
-		end)
-		if ok and cf then
-			return cf.Position
-		end
-	end
-
-	-- Folder / lainnya: rata-rata posisi semua BasePart di dalamnya
-	local Sum, Count = Vector3.zero, 0
-	for _, Part in ipairs(Object:GetDescendants()) do
-		if Part:IsA("BasePart") then
-			Sum += Part.Position
-			Count += 1
-		end
-	end
-
-	return Count > 0 and Sum / Count or nil
+local function GetBuild()
+	return workspace:FindFirstChild("Build")
 end
 
--- Cari pijakan di bawah titik (biar tidak teleport ke dalam tanah / langit)
-local function FindGround(Position)
+-- Cari tanah di titik X/Z (abaikan hitbox zona & karakter)
+local function GroundAt(X, Z, FromY)
 	local Params = RaycastParams.new()
 	Params.FilterType = Enum.RaycastFilterType.Exclude
-	Params.FilterDescendantsInstances = { Player.Character }
+	Params.RespectCanCollide = true
 
-	local Result = workspace:Raycast(Position + Vector3.new(0, 60, 0), Vector3.new(0, -250, 0), Params)
-	return Result and Result.Position or Position
+	local Ignore = { Player.Character }
+	local Build = GetBuild()
+	local Hitboxes = Build and Build:FindFirstChild("ZoneHitboxes")
+	if Hitboxes then
+		table.insert(Ignore, Hitboxes)
+	end
+	Params.FilterDescendantsInstances = Ignore
+
+	local Origin = Vector3.new(X, FromY or 40, Z)
+	local Result = workspace:Raycast(Origin, Vector3.new(0, -200, 0), Params)
+	return Result and Result.Position or Vector3.new(X, 3, Z)
 end
 
 local ActiveTween
-local function TeleportTo(Position)
+local function TeleportTo(TargetCFrame)
 	local Root = GetRoot()
-	if not Root or not Position then
+	if not Root or not TargetCFrame then
 		return false
 	end
-
-	local Target = CFrame.new(Position + Vector3.new(0, Settings.HeightOffset, 0))
 
 	if ActiveTween then
 		ActiveTween:Cancel()
@@ -2442,200 +2564,244 @@ local function TeleportTo(Position)
 	end
 
 	if Settings.TeleportMode == "Tween" then
-		local Distance = (Root.Position - Target.Position).Magnitude
+		local Distance = (Root.Position - TargetCFrame.Position).Magnitude
 		local Duration = math.max(Distance / math.max(Settings.TweenSpeed, 1), 0.05)
 
-		ActiveTween = TweenService:Create(Root, TweenInfo.new(Duration, Enum.EasingStyle.Linear), { CFrame = Target })
+		-- Tahan karakter supaya tidak jatuh saat tween
+		local Hold = RunService.Heartbeat:Connect(function()
+			if Root.Parent then
+				Root.AssemblyLinearVelocity = Vector3.zero
+			end
+		end)
+
+		ActiveTween = TweenService:Create(Root, TweenInfo.new(Duration, Enum.EasingStyle.Linear), {
+			CFrame = TargetCFrame,
+		})
 		ActiveTween:Play()
 		ActiveTween.Completed:Wait()
 		ActiveTween = nil
+		Hold:Disconnect()
 	else
-		Root.CFrame = Target
+		Root.CFrame = TargetCFrame
 	end
 
 	Root.AssemblyLinearVelocity = Vector3.zero
 	return true
 end
 
-local function FirePromptsNear(Object)
-	if not fireproximityprompt or not Object then
-		return
+-- Berdiri di atas tanah pada posisi `Pos`, menghadap `LookAt`
+local function StandAt(Pos, LookAt)
+	local Ground = GroundAt(Pos.X, Pos.Z, Pos.Y + 25)
+	local Stand = Ground + Vector3.new(0, 3.5, 0)
+	if LookAt then
+		return CFrame.lookAt(Stand, Vector3.new(LookAt.X, Stand.Y, LookAt.Z))
 	end
-	for _, Prompt in ipairs(Object:GetDescendants()) do
-		if Prompt:IsA("ProximityPrompt") and Prompt.Enabled then
-			pcall(fireproximityprompt, Prompt)
-		end
-	end
+	return CFrame.new(Stand)
 end
 
 local function Notify(Title, Content)
-	task.spawn(function()
-		pcall(function()
-			Library:SetNotification({
-				Title = "RapHub",
-				Description = Title,
-				Content = Content,
-				Delay = 3,
-			})
-		end)
+	pcall(function()
+		Library:SetNotification({
+			Title = "RapHub",
+			Description = Title,
+			Content = Content,
+			Delay = 3,
+		})
 	end)
 end
 
 ---------------------------------------------------------------------
--- Egg
+-- Telur
 ---------------------------------------------------------------------
--- Tempat egg yang muncul di map (lihat Explorer: Workspace.Eggs)
-local function GetEggContainers()
-	local List = {}
-	local EggFolder = workspace:FindFirstChild("Eggs")
-	if EggFolder then
-		table.insert(List, EggFolder)
+local NameCache = setmetatable({}, { __mode = "k" })
+
+-- Nama telur seperti yang tampil di game ("Luna Egg"), dengan cadangan
+local function EggDisplayName(Model, Part)
+	if NameCache[Model] then
+		return NameCache[Model]
 	end
-	return List
+
+	-- Label nama bisa ada di part "Egg" atau "Outer", jadi cari di seluruh model
+	local Ui = Model:FindFirstChild("EggInfoUi", true)
+	local Label = Ui and Ui:FindFirstChild("Name")
+	if Label and Label:IsA("TextLabel") and Label.Text ~= "" then
+		NameCache[Model] = Label.Text
+		return Label.Text
+	end
+
+	-- Cadangan (tidak di-cache, label mungkin belum terisi)
+	return Part:GetAttribute("EggInfoName") or Part:GetAttribute("EggType") or (Model.Name:gsub("^%d+:%s*", ""))
 end
 
--- Kumpulkan egg: Model/BasePart di dalam container (Folder ditelusuri lagi)
+local function ReadEgg(Model, ZoneId)
+	if not Model:IsA("Model") then
+		return nil
+	end
+	local Part = Model:FindFirstChild("Egg")
+	if not Part or not Part:IsA("BasePart") then
+		return nil
+	end
+	if Part:GetAttribute("Broken") == true then
+		return nil
+	end
+
+	local ZoneIdx = Part:GetAttribute("ZoneIndex")
+	ZoneId = ZoneId or (ZoneIdx and ("Zone" .. ZoneIdx)) or "Lainnya"
+
+	return {
+		Model = Model,
+		Part = Part,
+		Name = EggDisplayName(Model, Part),
+		Rarity = Part:GetAttribute("EggInfoRarity") or "?",
+		ZoneId = ZoneId,
+		Luck = ParseShort(Part:GetAttribute("EggInfoLuck")),
+		Weight = tonumber(Part:GetAttribute("WeightKg")) or 0,
+		Position = Part.Position,
+		Size = Part.Size,
+	}
+end
+
+-- Semua telur yang sedang ada di map
 local function CollectEggs()
 	local Eggs = {}
+	local Build = GetBuild()
+	local ZoneBuilds = Build and Build:FindFirstChild("ZoneBuilds")
 
-	local function Scan(Parent, Depth)
-		for _, Child in ipairs(Parent:GetChildren()) do
-			if Child:IsA("Model") or Child:IsA("BasePart") then
-				table.insert(Eggs, Child)
-			elseif (Child:IsA("Folder") or Child:IsA("Configuration")) and Depth < 3 then
-				Scan(Child, Depth + 1)
+	if ZoneBuilds then
+		for _, Zone in ipairs(ZoneBuilds:GetChildren()) do
+			local Folder = Zone:FindFirstChild("Eggs")
+			if Folder then
+				for _, Model in ipairs(Folder:GetChildren()) do
+					local Egg = ReadEgg(Model, Zone.Name)
+					if Egg then
+						table.insert(Eggs, Egg)
+					end
+				end
 			end
 		end
 	end
 
-	for _, Container in ipairs(GetEggContainers()) do
-		Scan(Container, 0)
+	-- Telur event / spesial
+	local Extra = workspace:FindFirstChild("Eggs")
+	if Extra then
+		for _, Model in ipairs(Extra:GetChildren()) do
+			local Egg = ReadEgg(Model, nil)
+			if Egg then
+				table.insert(Eggs, Egg)
+			end
+		end
 	end
 
 	return Eggs
 end
 
-local function EggPassesFilter(Egg)
-	if #Settings.EggFilter == 0 then
-		return true
-	end
-	return table.find(Settings.EggFilter, Egg.Name) ~= nil
-end
-
-local function GetNearestEgg(Exclude)
+local function Distance(Egg)
 	local Root = GetRoot()
-	if not Root then
-		return nil
-	end
-
-	local Best, BestDist = nil, math.huge
-	for _, Egg in ipairs(CollectEggs()) do
-		if EggPassesFilter(Egg) and not (Exclude and Exclude[Egg]) then
-			local Pos = GetPosition(Egg)
-			if Pos then
-				local Dist = (Pos - Root.Position).Magnitude
-				if Dist < BestDist then
-					Best, BestDist = Egg, Dist
-				end
-			end
-		end
-	end
-	return Best
+	return Root and (Egg.Position - Root.Position).Magnitude or 0
 end
 
+-- Teleport ke samping telur, menghadap telur
 local function TeleportToEgg(Egg)
-	local Pos = GetPosition(Egg)
-	if not Pos then
+	if not Egg or not Egg.Part.Parent then
 		return false
 	end
-	local ok = TeleportTo(Pos)
-	if ok and Settings.AutoPrompt then
-		task.wait(0.2)
-		FirePromptsNear(Egg)
-	end
-	return ok
-end
+	local EggPos = Egg.Part.Position
+	local Radius = math.max(Egg.Size.X, Egg.Size.Z) / 2 + 3
 
--- Nama semua jenis egg (yang sedang muncul + dari ReplicatedStorage.Eggs)
-local function GetEggTypeNames()
-	local Names, Seen = {}, {}
-
-	local function Add(Name)
-		if not Seen[Name] then
-			Seen[Name] = true
-			table.insert(Names, Name)
+	-- Dekati dari arah pemain sekarang (lebih natural), cadangan dari sisi +X
+	local Root = GetRoot()
+	local Dir = Vector3.new(1, 0, 0)
+	if Root then
+		local Flat = Vector3.new(Root.Position.X - EggPos.X, 0, Root.Position.Z - EggPos.Z)
+		if Flat.Magnitude > 1 then
+			Dir = Flat.Unit
 		end
 	end
 
-	for _, Egg in ipairs(CollectEggs()) do
-		Add(Egg.Name)
-	end
+	return TeleportTo(StandAt(EggPos + Dir * Radius, EggPos))
+end
 
-	local RSEggs = ReplicatedStorage:FindFirstChild("Eggs")
-	if RSEggs then
-		for _, Obj in ipairs(RSEggs:GetDescendants()) do
-			if Obj:IsA("Model") and Obj.Parent and not Obj.Parent:IsA("Model") then
-				Add(Obj.Name)
-			end
-		end
-	end
-
-	table.sort(Names)
-	return Names
+-- Label dropdown: "Luna Egg [Void] - Fairy Castle"
+local function EggKey(Egg)
+	return string.format("%s [%s] - %s", Egg.Name, Egg.Rarity, ZoneName(Egg.ZoneId))
 end
 
 ---------------------------------------------------------------------
--- Area / Zone
+-- Zona & lokasi
 ---------------------------------------------------------------------
-local function GetZones()
+local function GetZoneList()
 	local Zones = {}
-	local Build = workspace:FindFirstChild("Build")
+	local Build = GetBuild()
 	local ZoneBuilds = Build and Build:FindFirstChild("ZoneBuilds")
-	local ZoneHitboxes = Build and Build:FindFirstChild("ZoneHitboxes")
-
-	local Source = ZoneBuilds or ZoneHitboxes
-	if not Source then
-		return Zones
-	end
-
-	for _, Zone in ipairs(Source:GetChildren()) do
-		table.insert(Zones, Zone.Name)
-	end
-
-	-- Urutkan berdasarkan angka (Zone2 sebelum Zone10)
-	table.sort(Zones, function(a, b)
-		local na, nb = tonumber(a:match("%d+")), tonumber(b:match("%d+"))
-		if na and nb and na ~= nb then
-			return na < nb
+	if ZoneBuilds then
+		for _, Zone in ipairs(ZoneBuilds:GetChildren()) do
+			table.insert(Zones, Zone.Name)
 		end
-		return a < b
+	end
+	table.sort(Zones, function(a, b)
+		return ZoneIndex(a) < ZoneIndex(b)
 	end)
-
 	return Zones
 end
 
-local function GetZonePosition(ZoneName)
-	local Build = workspace:FindFirstChild("Build")
+local function ZoneLabel(ZoneId)
+	return string.format("%d. %s", ZoneIndex(ZoneId), ZoneName(ZoneId))
+end
+
+local function ZoneTargetCFrame(ZoneId)
+	local Build = GetBuild()
 	if not Build then
 		return nil
 	end
 
-	local ZoneBuilds = Build:FindFirstChild("ZoneBuilds")
-	local Zone = ZoneBuilds and ZoneBuilds:FindFirstChild(ZoneName)
+	local Index = ZoneIndex(ZoneId)
+	local Hitboxes = Build:FindFirstChild("ZoneHitboxes")
+	local Hitbox = Hitboxes and Hitboxes:FindFirstChild(tostring(Index))
 
-	if Zone then
-		-- Prioritas: area egg di zona itu (tempat utama), lalu tengah zona
-		local Target = Zone:FindFirstChild("Eggs") or Zone
-		local Pos = GetPosition(Target)
-		if Pos then
-			return FindGround(Pos)
+	if Settings.ZoneTarget == "Area Telur" then
+		local Sum, Count = Vector3.zero, 0
+		for _, Egg in ipairs(CollectEggs()) do
+			if Egg.ZoneId == ZoneId then
+				Sum += Egg.Position
+				Count += 1
+			end
 		end
+		if Count > 0 then
+			return StandAt(Sum / Count)
+		end
+		-- tidak ada telur -> lanjut ke pintu masuk
 	end
 
-	local ZoneHitboxes = Build:FindFirstChild("ZoneHitboxes")
-	local Hitbox = ZoneHitboxes and ZoneHitboxes:FindFirstChild(ZoneName)
-	local Pos = GetPosition(Hitbox)
-	return Pos and FindGround(Pos) or nil
+	if Hitbox and Hitbox:IsA("BasePart") then
+		local Center = Hitbox.Position
+		if Settings.ZoneTarget == "Tengah Zona" then
+			return StandAt(Vector3.new(Center.X, 15, Center.Z))
+		end
+		-- Pintu masuk = sisi zona yang menghadap base (arah +X), menghadap ke dalam zona
+		local Entrance = Vector3.new(Center.X + Hitbox.Size.X / 2 - 12, 15, Center.Z)
+		return StandAt(Entrance, Vector3.new(Center.X, 0, Center.Z))
+	end
+
+	-- Cadangan: pivot model zona
+	local ZoneBuilds = Build:FindFirstChild("ZoneBuilds")
+	local Zone = ZoneBuilds and ZoneBuilds:FindFirstChild(ZoneId)
+	if Zone and Zone:IsA("Model") then
+		return StandAt(Zone:GetPivot().Position)
+	end
+	return nil
+end
+
+local function MyPlot()
+	local Plots = workspace:FindFirstChild("Plots")
+	if not Plots then
+		return nil
+	end
+	for _, Plot in ipairs(Plots:GetChildren()) do
+		if Plot:GetAttribute("OwnerUserId") == Player.UserId then
+			return Plot
+		end
+	end
+	return nil
 end
 
 ---------------------------------------------------------------------
@@ -2645,76 +2811,106 @@ local Window = Library:CreateWindow({
 	Title = "RapHub",
 	Description = "Break and Steal an Egg",
 	["Tab Width"] = 120,
+	SizeUi = UDim2.fromOffset(560, 340),
 })
 
-local MainTab = Window:CreateTab({ Name = "Teleport", Icon = "" })
+local EggTab = Window:CreateTab({ Name = "Telur", Icon = "" })
+local AreaTab = Window:CreateTab({ Name = "Area", Icon = "" })
 local SettingTab = Window:CreateTab({ Name = "Settings", Icon = "" })
 
--- ===== Egg Teleport =====
-local EggSection = MainTab:AddSection("Egg Teleport", true)
+-- ===================== Tab Telur =====================
+local EggSection = EggTab:AddSection("Teleport Telur", true)
 
 local EggInfo = EggSection:AddParagraph({
-	Title = "Egg di map",
+	Title = "Telur di map",
 	Content = "Menghitung...",
 })
 
-local SelectedEggName = nil
+local SelectedEggKey = nil
+local LastEggOptions = ""
 
--- Telur terdekat dengan nama tertentu yang sedang ada di map
-local function FindEggByName(Name)
-	local Root = GetRoot()
+local EggDropdown = EggSection:AddDropdown({
+	Title = "Pilih Telur",
+	Content = "Telur yang sedang muncul",
+	Multi = false,
+	Options = {},
+	Default = {},
+	Callback = function(Value)
+		SelectedEggKey = Value and Value[1] or nil
+	end,
+})
+
+-- Susun daftar telur (urut zona lalu nama) + perbarui info
+local function RefreshEggList(Force)
+	local Eggs = CollectEggs()
+	local Count, Order = {}, {}
+
+	for _, Egg in ipairs(Eggs) do
+		local Key = EggKey(Egg)
+		if not Count[Key] then
+			Count[Key] = 0
+			table.insert(Order, { Key = Key, Zone = ZoneIndex(Egg.ZoneId), Name = Egg.Name })
+		end
+		Count[Key] += 1
+	end
+
+	table.sort(Order, function(a, b)
+		if a.Zone ~= b.Zone then
+			return a.Zone < b.Zone
+		end
+		return a.Name < b.Name
+	end)
+
+	local Options = {}
+	for _, Item in ipairs(Order) do
+		table.insert(Options, Item.Key)
+	end
+
+	local Joined = table.concat(Options, "|")
+	if Force or Joined ~= LastEggOptions then
+		LastEggOptions = Joined
+		local Keep = (SelectedEggKey and table.find(Options, SelectedEggKey)) and { SelectedEggKey } or {}
+		EggDropdown:Refresh(Options, Keep)
+		SelectedEggKey = Keep[1]
+	end
+
+	EggInfo:Set({
+		Title = "Telur di map",
+		Content = string.format("%d telur, %d jenis", #Eggs, #Options),
+	})
+
+	return Eggs
+end
+
+local function NearestEgg(Filter)
 	local Best, BestDist = nil, math.huge
 	for _, Egg in ipairs(CollectEggs()) do
-		if Egg.Name == Name then
-			local Pos = GetPosition(Egg)
-			if Pos then
-				local Dist = Root and (Pos - Root.Position).Magnitude or 0
-				if Dist < BestDist then
-					Best, BestDist = Egg, Dist
-				end
+		if not Filter or Filter(Egg) then
+			local Dist = Distance(Egg)
+			if Dist < BestDist then
+				Best, BestDist = Egg, Dist
 			end
 		end
 	end
 	return Best
 end
 
-local EggDropdown = EggSection:AddDropdown({
-	Title = "Pilih Telur",
-	Content = "Daftar telur di game",
-	Multi = false,
-	Options = GetEggTypeNames(),
-	Default = {},
-	Callback = function(Value)
-		SelectedEggName = Value and Value[1] or nil
-	end,
-})
-
-local function UpdateEggInfo()
-	local Count = 0
-	for _, Egg in ipairs(CollectEggs()) do
-		if EggPassesFilter(Egg) then
-			Count += 1
-		end
-	end
-	EggInfo:Set({
-		Title = "Egg di map",
-		Content = Count .. " egg ditemukan" .. (#Settings.EggFilter > 0 and " (pakai filter)" or ""),
-	})
-end
-
 EggSection:AddButton({
-	Title = "Teleport ke Telur",
+	Title = "Teleport ke Telur Terpilih",
 	Content = "Ke telur pilihan yang paling dekat",
 	Callback = function()
-		if not SelectedEggName then
-			Notify("Egg", "Pilih telur dulu.")
+		if not SelectedEggKey then
+			Notify("Telur", "Pilih telur dulu di dropdown.")
 			return
 		end
-		local Egg = FindEggByName(SelectedEggName)
+		local Egg = NearestEgg(function(Egg)
+			return EggKey(Egg) == SelectedEggKey
+		end)
 		if Egg then
 			TeleportToEgg(Egg)
 		else
-			Notify("Egg", SelectedEggName .. " belum muncul di map.")
+			Notify("Telur", "Telur itu sudah tidak ada. Daftar diperbarui.")
+			RefreshEggList(true)
 		end
 	end,
 })
@@ -2723,104 +2919,227 @@ EggSection:AddButton({
 	Title = "Teleport ke Telur Terdekat",
 	Content = "Langsung ke telur paling dekat",
 	Callback = function()
-		local Egg = GetNearestEgg()
+		local Egg = NearestEgg()
 		if Egg then
 			TeleportToEgg(Egg)
 		else
-			Notify("Egg", "Tidak ada telur yang cocok saat ini.")
+			Notify("Telur", "Tidak ada telur di map.")
 		end
 	end,
 })
 
 EggSection:AddButton({
 	Title = "Refresh Daftar Telur",
-	Content = "Muat ulang nama telur",
+	Content = "Daftar juga diperbarui otomatis",
 	Callback = function()
-		EggDropdown:Refresh(GetEggTypeNames(), {})
-		SelectedEggName = nil
-		UpdateEggInfo()
+		RefreshEggList(true)
 	end,
 })
 
+-- ===================== Auto Telur =====================
+local AutoSection = EggTab:AddSection("Auto Teleport Telur", false)
+
 local AutoEgg = false
-EggSection:AddToggle({
-	Title = "Auto Teleport Egg Baru",
-	Content = "Otomatis pindah ke tiap egg yang muncul",
+AutoSection:AddToggle({
+	Title = "Auto Teleport Telur",
+	Content = "Pindah ke telur berikutnya saat telur pecah / hilang",
 	Default = false,
 	Callback = function(Value)
 		AutoEgg = Value
 	end,
 })
 
--- ===== Filter Egg =====
-local FilterSection = MainTab:AddSection("Filter Egg", false)
+AutoSection:AddDropdown({
+	Title = "Prioritas",
+	Content = "Telur mana yang didatangi dulu",
+	Multi = false,
+	Options = { "Terdekat", "Luck Tertinggi", "Terberat" },
+	Default = { "Terdekat" },
+	Callback = function(Value)
+		Settings.AutoPriority = Value and Value[1] or "Terdekat"
+	end,
+})
 
-local FilterDropdown = FilterSection:AddDropdown({
-	Title = "Jenis Egg",
-	Content = "Kosong = semua egg",
+local function AllEggNames()
+	local Seen, List = {}, {}
+	for _, Egg in ipairs(CollectEggs()) do
+		if not Seen[Egg.Name] then
+			Seen[Egg.Name] = true
+			table.insert(List, Egg.Name)
+		end
+	end
+	table.sort(List)
+	return List
+end
+
+local NameFilter = AutoSection:AddDropdown({
+	Title = "Filter Nama Telur",
+	Content = "Kosong = semua telur",
 	Multi = true,
-	Options = GetEggTypeNames(),
+	Options = AllEggNames(),
 	Default = {},
 	Callback = function(Value)
-		Settings.EggFilter = Value or {}
+		Settings.AutoNames = Value or {}
 	end,
 })
 
-FilterSection:AddButton({
-	Title = "Refresh Jenis Egg",
-	Content = "Muat ulang nama-nama egg",
+AutoSection:AddDropdown({
+	Title = "Filter Rarity",
+	Content = "Kosong = semua rarity",
+	Multi = true,
+	Options = table.clone(RARITY_ORDER),
+	Default = {},
+	Callback = function(Value)
+		Settings.AutoRarities = Value or {}
+	end,
+})
+
+AutoSection:AddButton({
+	Title = "Refresh Filter Nama",
+	Content = "Ambil ulang nama telur di map",
 	Callback = function()
-		FilterDropdown:Refresh(GetEggTypeNames(), Settings.EggFilter)
+		NameFilter:Refresh(AllEggNames(), Settings.AutoNames)
 	end,
 })
 
--- ===== Area Teleport =====
-local AreaSection = MainTab:AddSection("Area Teleport", true)
+AutoSection:AddSlider({
+	Title = "Maks Waktu per Telur",
+	Content = "Detik sebelum pindah telur",
+	Increment = 1,
+	Min = 2,
+	Max = 60,
+	Default = Settings.AutoStayTime,
+	Callback = function(Value)
+		Settings.AutoStayTime = Value
+	end,
+})
+
+local function PassAutoFilter(Egg)
+	if #Settings.AutoNames > 0 and not table.find(Settings.AutoNames, Egg.Name) then
+		return false
+	end
+	if #Settings.AutoRarities > 0 and not table.find(Settings.AutoRarities, Egg.Rarity) then
+		return false
+	end
+	return true
+end
+
+local function PickAutoEgg(Skip)
+	local Best, BestScore = nil, nil
+	for _, Egg in ipairs(CollectEggs()) do
+		if PassAutoFilter(Egg) and not Skip[Egg.Model] then
+			local Score
+			if Settings.AutoPriority == "Luck Tertinggi" then
+				Score = -Egg.Luck
+			elseif Settings.AutoPriority == "Terberat" then
+				Score = -Egg.Weight
+			else
+				Score = Distance(Egg)
+			end
+			if not BestScore or Score < BestScore then
+				Best, BestScore = Egg, Score
+			end
+		end
+	end
+	return Best
+end
+
+-- ===================== Tab Area =====================
+local ZoneSection = AreaTab:AddSection("Teleport Zona", true)
+
+local ZoneByLabel = {}
+local function ZoneOptions()
+	ZoneByLabel = {}
+	local List = {}
+	for _, ZoneId in ipairs(GetZoneList()) do
+		local Label = ZoneLabel(ZoneId)
+		ZoneByLabel[Label] = ZoneId
+		table.insert(List, Label)
+	end
+	return List
+end
 
 local SelectedZone = nil
-local ZoneDropdown = AreaSection:AddDropdown({
-	Title = "Pilih Area",
-	Content = "Zona di map",
+ZoneSection:AddDropdown({
+	Title = "Pilih Zona",
+	Content = "Semua zona di map",
 	Multi = false,
-	Options = GetZones(),
+	Options = ZoneOptions(),
 	Default = {},
 	Callback = function(Value)
-		SelectedZone = Value and Value[1] or nil
+		SelectedZone = Value and Value[1] and ZoneByLabel[Value[1]] or nil
 	end,
 })
 
-AreaSection:AddButton({
-	Title = "Teleport ke Area",
-	Content = "Pindah ke area yang dipilih",
+ZoneSection:AddDropdown({
+	Title = "Titik Tujuan",
+	Content = "Posisi di dalam zona",
+	Multi = false,
+	Options = { "Pintu Masuk", "Tengah Zona", "Area Telur" },
+	Default = { "Pintu Masuk" },
+	Callback = function(Value)
+		Settings.ZoneTarget = Value and Value[1] or "Pintu Masuk"
+	end,
+})
+
+ZoneSection:AddButton({
+	Title = "Teleport ke Zona",
+	Content = "Pindah ke zona yang dipilih",
 	Callback = function()
 		if not SelectedZone then
-			Notify("Area", "Pilih area dulu.")
+			Notify("Area", "Pilih zona dulu.")
 			return
 		end
-		local Pos = GetZonePosition(SelectedZone)
-		if Pos then
-			TeleportTo(Pos)
+		local Target = ZoneTargetCFrame(SelectedZone)
+		if Target then
+			TeleportTo(Target)
 		else
-			Notify("Area", "Posisi " .. SelectedZone .. " tidak ditemukan.")
+			Notify("Area", "Posisi " .. ZoneName(SelectedZone) .. " tidak ditemukan.")
 		end
 	end,
 })
 
-AreaSection:AddButton({
-	Title = "Refresh Area",
-	Content = "Muat ulang daftar zona",
+local PlaceSection = AreaTab:AddSection("Lokasi Lain", true)
+
+PlaceSection:AddButton({
+	Title = "Base Saya",
+	Content = "Kembali ke plot milikmu",
 	Callback = function()
-		ZoneDropdown:Refresh(GetZones(), {})
-		SelectedZone = nil
+		local Plot = MyPlot()
+		local Spawn = Plot and (Plot:FindFirstChild("SpawnPoint") or Plot:FindFirstChild("Hitbox"))
+		if Spawn and Spawn:IsA("BasePart") then
+			TeleportTo(StandAt(Spawn.Position))
+		else
+			Notify("Area", "Base kamu tidak ditemukan.")
+		end
 	end,
 })
 
--- ===== Settings =====
+local function AddModelButton(Title, Content, ModelName)
+	PlaceSection:AddButton({
+		Title = Title,
+		Content = Content,
+		Callback = function()
+			local Model = workspace:FindFirstChild(ModelName)
+			if Model and Model:IsA("Model") then
+				local Pos = Model:GetPivot().Position
+				TeleportTo(StandAt(Pos + Vector3.new(10, 0, 0), Pos))
+			else
+				Notify("Area", Title .. " tidak ditemukan.")
+			end
+		end,
+	})
+end
+
+AddModelButton("Animal Merging", "Mesin merge hewan", "EggMachine")
+AddModelButton("Fuse Machine", "Mesin fuse", "FuseMachine")
+
+-- ===================== Settings =====================
 local TpSection = SettingTab:AddSection("Teleport", true)
 
 TpSection:AddDropdown({
 	Title = "Mode Teleport",
-	Content = "Instant atau Tween (lebih halus)",
+	Content = "Instant atau Tween (bergerak halus)",
 	Multi = false,
 	Options = { "Instant", "Tween" },
 	Default = { "Instant" },
@@ -2833,78 +3152,66 @@ TpSection:AddSlider({
 	Title = "Kecepatan Tween",
 	Content = "Stud per detik",
 	Increment = 10,
-	Min = 30,
-	Max = 500,
+	Min = 50,
+	Max = 1000,
 	Default = Settings.TweenSpeed,
 	Callback = function(Value)
 		Settings.TweenSpeed = Value
 	end,
 })
 
-TpSection:AddSlider({
-	Title = "Tinggi Offset",
-	Content = "Jarak di atas target",
-	Increment = 1,
-	Min = 0,
-	Max = 20,
-	Default = Settings.HeightOffset,
-	Callback = function(Value)
-		Settings.HeightOffset = Value
-	end,
-})
-
-TpSection:AddSlider({
-	Title = "Jeda Auto Teleport",
-	Content = "Detik antar egg",
-	Increment = 1,
-	Min = 0,
-	Max = 10,
-	Default = Settings.AutoDelay,
-	Callback = function(Value)
-		Settings.AutoDelay = Value
-	end,
-})
-
-TpSection:AddToggle({
-	Title = "Auto Tekan Prompt",
-	Content = "Tekan ProximityPrompt egg setelah teleport (butuh executor yang support)",
-	Default = false,
-	Callback = function(Value)
-		Settings.AutoPrompt = Value
-	end,
+local UiSection = SettingTab:AddSection("Panel", true)
+UiSection:AddParagraph({
+	Title = "Tips",
+	Content = "RightControl = buka/tutup panel. Tarik pojok kanan bawah untuk ubah ukuran.",
 })
 
 ---------------------------------------------------------------------
 -- Loop
 ---------------------------------------------------------------------
-UpdateEggInfo()
+RefreshEggList(true)
 
--- Auto teleport: datangi tiap egg sekali, lanjut ke egg baru yang muncul
+-- Perbarui daftar telur berkala (pilihan tetap dipertahankan)
 task.spawn(function()
-	local Visited = setmetatable({}, { __mode = "k" })
-
 	while not Library.Unloaded do
-		if AutoEgg then
-			local Egg = GetNearestEgg(Visited)
-			if Egg then
-				Visited[Egg] = true
-				TeleportToEgg(Egg)
-				task.wait(Settings.AutoDelay)
-			else
-				task.wait(0.5)
-			end
-		else
-			table.clear(Visited)
-			task.wait(0.5)
-		end
+		task.wait(4)
+		pcall(RefreshEggList, false)
 	end
 end)
 
--- Update jumlah egg secara berkala
+-- Auto: datangi telur, tunggu sampai pecah/hilang atau waktu habis, lalu lanjut
 task.spawn(function()
+	local Skip = setmetatable({}, { __mode = "k" })
+
 	while not Library.Unloaded do
-		task.wait(3)
-		pcall(UpdateEggInfo)
+		if AutoEgg then
+			local Egg = PickAutoEgg(Skip)
+			if Egg then
+				TeleportToEgg(Egg)
+
+				local Started = os.clock()
+				while
+					AutoEgg
+					and not Library.Unloaded
+					and Egg.Model.Parent
+					and Egg.Part.Parent
+					and Egg.Part:GetAttribute("Broken") ~= true
+					and os.clock() - Started < Settings.AutoStayTime
+				do
+					task.wait(0.25)
+				end
+
+				-- Waktu habis tapi telur masih ada: lewati sementara
+				if Egg.Model.Parent and Egg.Part:GetAttribute("Broken") ~= true then
+					Skip[Egg.Model] = true
+				end
+			else
+				table.clear(Skip)
+				task.wait(1)
+			end
+		else
+			task.wait(0.5)
+		end
 	end
 end)
 
