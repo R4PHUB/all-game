@@ -108,11 +108,18 @@ local function OpenClose()
 		Visible = false,
 	}, Button)
 
+	-- "R" hanya tampil selama logo belum termuat; hilang otomatis begitu logo siap
+	local function UpdateFallback()
+		Fallback.Visible = not Button.IsLoaded
+	end
+	Button:GetPropertyChangedSignal("IsLoaded"):Connect(UpdateFallback)
+	Button:GetPropertyChangedSignal("Visible"):Connect(UpdateFallback)
+
 	task.spawn(function()
 		pcall(function()
-			game:GetService("ContentProvider"):PreloadAsync({ Button })
+			game:GetService("ContentProvider"):PreloadAsync({ Custom.LogoImage })
 		end)
-		Fallback.Visible = not Button.IsLoaded
+		UpdateFallback()
 	end)
 
 	-- Bisa digeser; geser tidak dianggap klik
@@ -2417,7 +2424,8 @@ local Player = Players.LocalPlayer
 -- Setting
 ---------------------------------------------------------------------
 local Settings = {
-	TeleportMode = "Instant", -- "Instant" | "Tween"
+	TeleportMode = "Jalan (Aman)", -- "Jalan (Aman)" | "Instant" | "Tween"
+	WalkMultiplier = 1, -- pengali WalkSpeed untuk mode Jalan (Aman)
 	TweenSpeed = 300, -- stud per detik
 	ZoneTarget = "Pintu Masuk", -- "Pintu Masuk" | "Tengah Zona" | "Area Telur"
 	AutoPriority = "Terdekat", -- "Terdekat" | "Luck Tertinggi" | "Terberat"
@@ -2551,16 +2559,77 @@ local function GroundAt(X, Z, FromY)
 	return Result and Result.Position or Vector3.new(X, 3, Z)
 end
 
+local function GetHumanoid()
+	local Character = Player.Character
+	return Character and Character:FindFirstChildOfClass("Humanoid")
+end
+
 local ActiveTween
+local MoveToken = 0
+local PullBackWarning -- diisi setelah fungsi Notify ada
+
+-- Hentikan gerakan yang sedang berjalan (jalan aman / tween)
+local function StopMoving()
+	MoveToken += 1
+	if ActiveTween then
+		ActiveTween:Cancel()
+		ActiveTween = nil
+	end
+end
+
+--[[
+	Mode "Jalan (Aman)": geser karakter tiap frame sambil tetap menempel di tanah,
+	dengan kecepatan = WalkSpeed x pengali. Server melihatnya seperti berlari biasa,
+	jadi tidak kena anti-cheat (fly / teleport ditarik balik).
+]]
+local function WalkTo(TargetCFrame, Token)
+	local Root, Humanoid = GetRoot(), GetHumanoid()
+	if not Root or not Humanoid then
+		return false
+	end
+
+	local Target = TargetCFrame.Position
+	local HipOffset = Humanoid.HipHeight + Root.Size.Y / 2
+
+	while Token == MoveToken and Root.Parent and Humanoid.Health > 0 do
+		local Dt = RunService.Heartbeat:Wait()
+		local Pos = Root.Position
+		local Flat = Vector3.new(Target.X - Pos.X, 0, Target.Z - Pos.Z)
+		local Dist = Flat.Magnitude
+		if Dist < 1.5 then
+			break
+		end
+
+		local Dir = Flat.Unit
+		local Speed = math.max(Humanoid.WalkSpeed, 16) * Settings.WalkMultiplier
+		local Next = Pos + Dir * math.min(Dist, Speed * Dt)
+		local Ground = GroundAt(Next.X, Next.Z, Pos.Y + 6)
+		local NewPos = Vector3.new(Next.X, Ground.Y + HipOffset, Next.Z)
+
+		Root.CFrame = CFrame.lookAt(NewPos, NewPos + Dir)
+		Root.AssemblyLinearVelocity = Dir * Speed
+	end
+
+	if Token ~= MoveToken or not Root.Parent then
+		return false
+	end
+
+	Root.CFrame = TargetCFrame
+	Root.AssemblyLinearVelocity = Vector3.zero
+	return true
+end
+
 local function TeleportTo(TargetCFrame)
 	local Root = GetRoot()
 	if not Root or not TargetCFrame then
 		return false
 	end
 
-	if ActiveTween then
-		ActiveTween:Cancel()
-		ActiveTween = nil
+	StopMoving()
+	local Token = MoveToken
+
+	if Settings.TeleportMode == "Jalan (Aman)" then
+		return WalkTo(TargetCFrame, Token)
 	end
 
 	if Settings.TeleportMode == "Tween" then
@@ -2583,10 +2652,19 @@ local function TeleportTo(TargetCFrame)
 		Hold:Disconnect()
 	else
 		Root.CFrame = TargetCFrame
+
+		-- Cek apakah server menarik balik karakter (anti-cheat)
+		task.delay(1.5, function()
+			if Token == MoveToken and Root.Parent and (Root.Position - TargetCFrame.Position).Magnitude > 25 then
+				if PullBackWarning then
+					PullBackWarning()
+				end
+			end
+		end)
 	end
 
 	Root.AssemblyLinearVelocity = Vector3.zero
-	return true
+	return Token == MoveToken
 end
 
 -- Berdiri di atas tanah pada posisi `Pos`, menghadap `LookAt`
@@ -2608,6 +2686,10 @@ local function Notify(Title, Content)
 			Delay = 3,
 		})
 	end)
+end
+
+PullBackWarning = function()
+	Notify("Anti-cheat", 'Teleport ditarik balik server. Pakai mode "Jalan (Aman)" di Settings.')
 end
 
 ---------------------------------------------------------------------
@@ -2946,6 +3028,9 @@ AutoSection:AddToggle({
 	Default = false,
 	Callback = function(Value)
 		AutoEgg = Value
+		if not Value then
+			StopMoving()
+		end
 	end,
 })
 
@@ -3139,12 +3224,32 @@ local TpSection = SettingTab:AddSection("Teleport", true)
 
 TpSection:AddDropdown({
 	Title = "Mode Teleport",
-	Content = "Instant atau Tween (bergerak halus)",
+	Content = "Jalan (Aman) = lolos anti-cheat. Instant/Tween bisa ditarik balik",
 	Multi = false,
-	Options = { "Instant", "Tween" },
-	Default = { "Instant" },
+	Options = { "Jalan (Aman)", "Instant", "Tween" },
+	Default = { "Jalan (Aman)" },
 	Callback = function(Value)
-		Settings.TeleportMode = Value and Value[1] or "Instant"
+		Settings.TeleportMode = Value and Value[1] or "Jalan (Aman)"
+	end,
+})
+
+TpSection:AddSlider({
+	Title = "Pengali Kecepatan Jalan",
+	Content = "x WalkSpeed (dibagi 10). 10 = normal, makin besar makin berisiko",
+	Increment = 1,
+	Min = 5,
+	Max = 30,
+	Default = 10,
+	Callback = function(Value)
+		Settings.WalkMultiplier = Value / 10
+	end,
+})
+
+TpSection:AddButton({
+	Title = "Stop Gerak",
+	Content = "Hentikan perjalanan yang sedang berlangsung",
+	Callback = function()
+		StopMoving()
 	end,
 })
 
