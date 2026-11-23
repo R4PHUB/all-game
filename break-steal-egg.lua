@@ -2424,7 +2424,8 @@ local Player = Players.LocalPlayer
 -- Setting
 ---------------------------------------------------------------------
 local Settings = {
-	TeleportMode = "Jalan (Aman)", -- "Jalan (Aman)" | "Instant" | "Tween"
+	TeleportMode = "Instant (Lompat)", -- "Instant (Lompat)" | "Jalan (Aman)" | "Tween"
+	StepSize = 28, -- stud per frame untuk mode Instant (Lompat), sama seperti Lynx
 	WalkMultiplier = 1, -- pengali WalkSpeed untuk mode Jalan (Aman)
 	TweenSpeed = 300, -- stud per detik
 	ZoneTarget = "Pintu Masuk", -- "Pintu Masuk" | "Tengah Zona" | "Area Telur"
@@ -2441,7 +2442,8 @@ local Farm = {
 	HitMode = "Swing Game (Aman)", -- "Swing Game (Aman)" | "Klik Virtual"
 	HitDelay = 0.15, -- detik antar pukulan
 	MaxTimePerEgg = 30, -- detik sebelum menyerah pada satu telur
-	ReturnWhenFull = true, -- pulang ke base saat satchel penuh
+	ReturnWhenFull = true, -- setor hewan saat satchel penuh
+	BankMode = "Lewat Guard (Cepat)", -- "Lewat Guard (Cepat)" | "Jalan ke Base"
 }
 
 ---------------------------------------------------------------------
@@ -2626,6 +2628,89 @@ local function WalkTo(TargetCFrame, Token)
 	return true
 end
 
+--[[
+	Fling window: saat ditangkap guard, server mengirim CatchFlingRemote "fling"
+	sampai "release" (~3 detik). Selama itu anti-cheat tidak memeriksa posisi,
+	jadi teleport jarak berapa pun aman (cara yang dipakai Lynx).
+]]
+local Fling = { Until = 0, Count = 0 }
+do
+	local CatchFling = ReplicatedStorage:FindFirstChild("CatchFlingRemote")
+	if CatchFling then
+		CatchFling.OnClientEvent:Connect(function(Kind, _, Duration)
+			if Kind == "fling" then
+				Fling.Count += 1
+				Fling.Until = os.clock() + math.max((tonumber(Duration) or 3) - 0.4, 0.5)
+			elseif Kind == "release" then
+				Fling.Until = 0
+			end
+		end)
+	end
+end
+
+local function InFlingWindow()
+	return os.clock() < Fling.Until
+end
+
+--[[
+	Mode "Instant (Lompat)": lompat StepSize stud per frame menyusuri tanah.
+	Lompatan kecil per frame tidak ditarik balik server (terbukti dari rekaman Lynx).
+	Kalau ternyata ditarik balik, jarak lompat otomatis dikecilkan.
+]]
+local function StepTo(TargetCFrame, Token)
+	local Root, Humanoid = GetRoot(), GetHumanoid()
+	if not Root or not Humanoid then
+		return false
+	end
+
+	local Target = TargetCFrame.Position
+	local HipOffset = Humanoid.HipHeight + Root.Size.Y / 2
+	local Expected, PullBacks = nil, 0
+
+	while Token == MoveToken and Root.Parent and Humanoid.Health > 0 do
+		if InFlingWindow() then
+			break -- bebas teleport langsung
+		end
+
+		local Pos = Root.Position
+		if Expected and (Pos - Expected).Magnitude > 40 then
+			PullBacks += 1
+			if PullBacks % 3 == 0 and Settings.StepSize > 10 then
+				Settings.StepSize = math.max(10, math.floor(Settings.StepSize * 0.7))
+				if PullBackWarning then
+					PullBackWarning()
+				end
+			end
+			task.wait(0.3)
+			Pos = Root.Position
+		end
+
+		local Flat = Vector3.new(Target.X - Pos.X, 0, Target.Z - Pos.Z)
+		local Dist = Flat.Magnitude
+		if Dist < 1.5 then
+			break
+		end
+
+		local Dir = Flat.Unit
+		local Next = Pos + Dir * math.min(Dist, Settings.StepSize)
+		local Ground = GroundAt(Next.X, Next.Z, Pos.Y + 6)
+		local NewPos = Vector3.new(Next.X, Ground.Y + HipOffset, Next.Z)
+
+		Root.CFrame = CFrame.lookAt(NewPos, NewPos + Dir)
+		Root.AssemblyLinearVelocity = Vector3.zero
+		Expected = NewPos
+		RunService.Heartbeat:Wait()
+	end
+
+	if Token ~= MoveToken or not Root.Parent then
+		return false
+	end
+
+	Root.CFrame = TargetCFrame
+	Root.AssemblyLinearVelocity = Vector3.zero
+	return true
+end
+
 local function TeleportTo(TargetCFrame)
 	local Root = GetRoot()
 	if not Root or not TargetCFrame then
@@ -2634,6 +2719,17 @@ local function TeleportTo(TargetCFrame)
 
 	StopMoving()
 	local Token = MoveToken
+
+	-- Sedang terpental guard: teleport langsung tanpa batas jarak
+	if InFlingWindow() then
+		Root.CFrame = TargetCFrame
+		Root.AssemblyLinearVelocity = Vector3.zero
+		return true
+	end
+
+	if Settings.TeleportMode == "Instant (Lompat)" then
+		return StepTo(TargetCFrame, Token)
+	end
 
 	if Settings.TeleportMode == "Jalan (Aman)" then
 		return WalkTo(TargetCFrame, Token)
@@ -2695,7 +2791,7 @@ local function Notify(Title, Content)
 end
 
 PullBackWarning = function()
-	Notify("Anti-cheat", 'Teleport ditarik balik server. Pakai mode "Jalan (Aman)".')
+	Notify("Anti-cheat", string.format("Ditarik balik server. Jarak lompat dikecilkan ke %d stud.", Settings.StepSize))
 end
 
 ---------------------------------------------------------------------
@@ -3019,6 +3115,7 @@ local CollectionService = game:GetService("CollectionService")
 local Place = {
 	Auto = false,
 	Rarities = {}, -- kosong = semua
+	Every = 5, -- mode setor lewat guard: pulang taruh hewan tiap N hewan di Backpack
 }
 
 local function AnimalTools()
@@ -3330,12 +3427,23 @@ FarmSection:AddToggle({
 
 FarmSection:AddDropdown({
 	Title = "Farm Mode",
-	Content = "Cara pindah ke telur",
+	Content = "Instant (Lompat) = cepat seperti Lynx. Jalan = paling pelan",
 	Multi = false,
-	Options = { "Jalan (Aman)", "Instant", "Tween" },
-	Default = { "Jalan (Aman)" },
+	Options = { "Instant (Lompat)", "Jalan (Aman)", "Tween" },
+	Default = { "Instant (Lompat)" },
 	Callback = function(Value)
-		Settings.TeleportMode = Value and Value[1] or "Jalan (Aman)"
+		Settings.TeleportMode = Value and Value[1] or "Instant (Lompat)"
+	end,
+})
+
+FarmSection:AddDropdown({
+	Title = "Cara Setor Hewan",
+	Content = "Lewat Guard = ditangkap guard lalu teleport ke SafeZone (seperti Lynx)",
+	Multi = false,
+	Options = { "Lewat Guard (Cepat)", "Jalan ke Base" },
+	Default = { "Lewat Guard (Cepat)" },
+	Callback = function(Value)
+		Farm.BankMode = Value and Value[1] or "Lewat Guard (Cepat)"
 	end,
 })
 
@@ -3351,8 +3459,8 @@ FarmSection:AddDropdown({
 })
 
 FarmSection:AddToggle({
-	Title = "Pulang Saat Satchel Penuh",
-	Content = "Bawa hewan ke base supaya tersimpan",
+	Title = "Setor Saat Satchel Penuh",
+	Content = "Simpan hewan yang dibawa supaya tidak hilang",
 	Default = true,
 	Callback = function(Value)
 		Farm.ReturnWhenFull = Value
@@ -3417,10 +3525,22 @@ AnimalSection:AddDropdown({
 
 AnimalSection:AddToggle({
 	Title = "Auto Taruh Hewan",
-	Content = "Taruh hewan otomatis setiap pulang ke base",
+	Content = "Taruh hewan otomatis di base saat farm",
 	Default = false,
 	Callback = function(Value)
 		Place.Auto = Value
+	end,
+})
+
+AnimalSection:AddSlider({
+	Title = "Taruh Tiap N Hewan",
+	Content = "Mode setor Lewat Guard: pulang ke base setelah Backpack berisi N hewan",
+	Increment = 1,
+	Min = 1,
+	Max = 20,
+	Default = Place.Every,
+	Callback = function(Value)
+		Place.Every = Value
 	end,
 })
 
@@ -3652,6 +3772,18 @@ AddModelButton("Fuse Machine", "Mesin fuse", "FuseMachine")
 local TpSection = SettingTab:AddSection("Teleport", true)
 
 TpSection:AddSlider({
+	Title = "Jarak Lompat per Frame",
+	Content = "Mode Instant (Lompat). Lynx ~28. Dikecilkan otomatis kalau ditarik balik",
+	Increment = 1,
+	Min = 8,
+	Max = 45,
+	Default = Settings.StepSize,
+	Callback = function(Value)
+		Settings.StepSize = Value
+	end,
+})
+
+TpSection:AddSlider({
 	Title = "Pengali Kecepatan Jalan",
 	Content = "x WalkSpeed (dibagi 10). 10 = normal, makin besar makin berisiko",
 	Increment = 1,
@@ -3737,6 +3869,176 @@ local function BankAndPlace()
 	end
 end
 
+---------------------------------------------------------------------
+-- Setor lewat guard (cara Lynx): ditangkap guard -> fling window ->
+-- ambil lagi hewan -> teleport ke SafeZone -> tersimpan -> teleport balik
+---------------------------------------------------------------------
+local function SafeSpot()
+	local Build = GetBuild()
+	local Hitboxes = Build and Build:FindFirstChild("ZoneHitboxes")
+	local Safe = Hitboxes and Hitboxes:FindFirstChild("SafeZone")
+	if not Safe or not Safe:IsA("BasePart") then
+		return nil
+	end
+	-- Tepi SafeZone dari arah zona + 7 stud (titik yang sama dipakai Lynx: x = -73)
+	local Edge = Safe.CFrame:PointToWorldSpace(Vector3.new(-Safe.Size.X / 2 + 7, 0, 0))
+	local Ground = GroundAt(Edge.X, 1, 20)
+	return CFrame.new(Ground + Vector3.new(0, 3.5, 0))
+end
+
+local function GuardPosition(Guard)
+	local Root = Guard:FindFirstChild("HumanoidRootPart") or Guard.PrimaryPart
+	if Root and Root:IsA("BasePart") then
+		return Root.Position
+	end
+	local ok, Pivot = pcall(function()
+		return Guard:GetPivot().Position
+	end)
+	return ok and Pivot or nil
+end
+
+-- Guard = model di ZoneBuilds.ZoneN yang punya atribut ChaseState
+local function FindGuard(ZoneId)
+	local Build = GetBuild()
+	local ZoneBuilds = Build and Build:FindFirstChild("ZoneBuilds")
+	local Root = GetRoot()
+	if not ZoneBuilds or not Root then
+		return nil
+	end
+	local Best, BestDist = nil, math.huge
+	for _, Zone in ipairs(ZoneBuilds:GetChildren()) do
+		if not ZoneId or Zone.Name == ZoneId then
+			for _, Model in ipairs(Zone:GetChildren()) do
+				if Model:IsA("Model") and Model:GetAttribute("ChaseState") ~= nil then
+					local Pos = GuardPosition(Model)
+					local Dist = Pos and (Pos - Root.Position).Magnitude or math.huge
+					if Dist < BestDist then
+						Best, BestDist = Model, Dist
+					end
+				end
+			end
+		end
+	end
+	return Best
+end
+
+local function FirePrompt(Prompt)
+	if fireproximityprompt and pcall(fireproximityprompt, Prompt) then
+		return
+	end
+	pcall(function()
+		Prompt:InputHoldBegin()
+		task.wait(Prompt.HoldDuration + 0.05)
+		Prompt:InputHoldEnd()
+	end)
+end
+
+-- Prompt hewan yang terjatuh (PromptAnchor muncul di dekat karakter saat ditangkap)
+local function NearestDropPrompt(MaxDist)
+	local Root = GetRoot()
+	if not Root then
+		return nil
+	end
+	local Best, BestDist = nil, MaxDist
+	for _, Anchor in ipairs(workspace:GetChildren()) do
+		if Anchor.Name == "PromptAnchor" and Anchor:IsA("BasePart") then
+			local Dist = (Anchor.Position - Root.Position).Magnitude
+			if Dist < BestDist then
+				local Prompt = Anchor:FindFirstChildWhichIsA("ProximityPrompt", true)
+				if Prompt then
+					Best, BestDist = Prompt, Dist
+				end
+			end
+		end
+	end
+	return Best
+end
+
+local function BankViaGuard()
+	local Root = GetRoot()
+	local Spot = SafeSpot()
+	if not Root or not Spot then
+		return false
+	end
+
+	local ReturnTo = Root.CFrame
+	local Guard = FindGuard(Player:GetAttribute("CarryingZone")) or FindGuard(nil)
+	if not Guard then
+		return false
+	end
+
+	SetStatus("Mendekati guard " .. Guard.Name .. " supaya ditangkap...")
+	StopMoving()
+	local Token = MoveToken
+	local StartFlings = Fling.Count
+	local Started = os.clock()
+
+	-- 1. Lompat ke arah guard sampai ditangkap
+	while Farm.Enabled and Token == MoveToken and Fling.Count == StartFlings and os.clock() - Started < 8 do
+		local GuardPos = GuardPosition(Guard)
+		local R, Hum = GetRoot(), GetHumanoid()
+		if not GuardPos or not R or not Hum then
+			break
+		end
+		local Flat = Vector3.new(GuardPos.X - R.Position.X, 0, GuardPos.Z - R.Position.Z)
+		if Flat.Magnitude > 2 then
+			local Next = R.Position + Flat.Unit * math.min(Flat.Magnitude - 1, Settings.StepSize)
+			local Ground = GroundAt(Next.X, Next.Z, R.Position.Y + 6)
+			local NewPos = Vector3.new(Next.X, Ground.Y + Hum.HipHeight + R.Size.Y / 2, Next.Z)
+			R.CFrame = CFrame.lookAt(NewPos, NewPos + Flat.Unit)
+			R.AssemblyLinearVelocity = Vector3.zero
+		end
+		RunService.Heartbeat:Wait()
+	end
+
+	if Fling.Count == StartFlings then
+		return false -- tidak tertangkap
+	end
+
+	-- 2. Hewan jatuh saat ditangkap -> ambil lagi secepatnya
+	local PickStart = os.clock()
+	while CarryCount() == 0 and os.clock() - PickStart < 0.6 do
+		local Prompt = NearestDropPrompt(25)
+		if Prompt then
+			FirePrompt(Prompt)
+		end
+		task.wait(0.03)
+	end
+
+	-- 3. Teleport ke SafeZone selama fling window -> hewan tersimpan
+	if CarryCount() > 0 and InFlingWindow() then
+		SetStatus("Teleport ke SafeZone...")
+		local R = GetRoot()
+		if R then
+			R.CFrame = Spot
+			R.AssemblyLinearVelocity = Vector3.zero
+		end
+		local BankStart = os.clock()
+		while CarryCount() > 0 and os.clock() - BankStart < 1.2 do
+			task.wait(0.05)
+		end
+	end
+
+	-- 4. Kembali ke tempat farm (masih fling window = teleport langsung)
+	EquipPickaxe()
+	TeleportTo(ReturnTo)
+	return true
+end
+
+local function Bank()
+	if Farm.BankMode == "Lewat Guard (Cepat)" then
+		if BankViaGuard() then
+			-- Sesekali pulang ke base untuk menaruh hewan
+			if Place.Auto and #AnimalTools() >= Place.Every then
+				BankAndPlace()
+			end
+			return
+		end
+		SetStatus("Guard tidak menangkap, setor jalan ke base...")
+	end
+	BankAndPlace()
+end
+
 -- Auto farm
 task.spawn(function()
 	local Skip = setmetatable({}, { __mode = "k" })
@@ -3755,7 +4057,7 @@ task.spawn(function()
 
 		-- Satchel penuh -> pulang ke base supaya hewan tersimpan
 		if Farm.ReturnWhenFull and CarryCount() >= SatchelCapacity() then
-			BankAndPlace()
+			Bank()
 			continue
 		end
 
@@ -3763,7 +4065,7 @@ task.spawn(function()
 		if not Egg then
 			-- Tidak ada telur cocok: setor dulu hewan yang sedang dibawa
 			if Farm.ReturnWhenFull and CarryCount() > 0 then
-				BankAndPlace()
+				Bank()
 				continue
 			end
 			SetStatus("Menunggu telur yang cocok...")
