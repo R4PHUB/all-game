@@ -2414,7 +2414,6 @@ end)()
 ]]
 
 local Players = game:GetService("Players")
-local TweenService = game:GetService("TweenService")
 local RunService = game:GetService("RunService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
@@ -2466,44 +2465,8 @@ local function Working()
 end
 
 ---------------------------------------------------------------------
--- Data game (dibaca dari ReplicatedStorage.Shared, ada cadangan)
+-- Data game: SEMUA nama diambil langsung dari game (tidak ada daftar manual)
 ---------------------------------------------------------------------
-local ZONE_NAMES = {
-	Zone1 = "Forest Zone",
-	Zone2 = "Desert Zone",
-	Zone3 = "Snowy Zone",
-	Zone4 = "Candy Zone",
-	Zone5 = "Swamp Zone",
-	Zone6 = "Ocean Zone",
-	Zone7 = "Volcano Zone",
-	Zone8 = "Blossom Zone",
-	Zone9 = "Galaxy Zone",
-	Zone10 = "Planet X Zone",
-	Zone11 = "Haunted Graveyard",
-	Zone12 = "Fairy Castle",
-	Zone13 = "Fantasy Expansion",
-	Zone14 = "Mount Olympus",
-	Zone15 = "Pirate Cove",
-}
-
-local RARITY_ORDER = {
-	"Common",
-	"Uncommon",
-	"Rare",
-	"Epic",
-	"Legendary",
-	"Mythic",
-	"Divine",
-	"Cosmic",
-	"Secret",
-	"Celestial",
-	"Inferno",
-	"Void",
-	"Omega",
-	"Spectral",
-	"Ethereal",
-}
-
 local function SafeRequire(Parent, Name)
 	local Module = Parent and Parent:FindFirstChild(Name)
 	if not Module then
@@ -2516,24 +2479,63 @@ end
 local Shared = ReplicatedStorage:FindFirstChild("Shared")
 local ZoneDisplayInfo = SafeRequire(Shared, "ZoneDisplayInfo")
 local ZonesConfig = SafeRequire(Shared, "ZonesConfig")
+local EggRewardsModule = SafeRequire(Shared, "EggRewards")
 
+-- Sumber data yang berhasil dipakai (ditampilkan di Settings > Diagnosa)
+local DataSource = { Zones = "tidak ada", Rarities = {} }
+
+-- Nama zona: modul ZoneDisplayInfo milik game
+local ZONE_NAMES = {}
 if ZoneDisplayInfo then
 	for ZoneId, Info in pairs(ZoneDisplayInfo) do
 		if type(Info) == "table" and type(Info.Name) == "string" then
 			ZONE_NAMES[ZoneId] = Info.Name
 		end
 	end
+	if next(ZONE_NAMES) then
+		DataSource.Zones = "ZoneDisplayInfo"
+	end
 end
 
-if ZonesConfig and type(ZonesConfig.Zones) == "table" then
-	local List = {}
-	for _, Zone in ipairs(ZonesConfig.Zones) do
-		if type(Zone) == "table" and Zone.Rarity then
-			table.insert(List, Zone.Rarity)
+-- Rarity: urutan tingkat dari ZonesConfig, lalu semua rarity lain yang ada di game
+local RARITY_ORDER = {}
+do
+	local Seen = {}
+	local function Add(Rarity, Source)
+		if type(Rarity) == "string" and Rarity ~= "" and not Seen[Rarity] then
+			Seen[Rarity] = true
+			table.insert(RARITY_ORDER, Rarity)
+			if not table.find(DataSource.Rarities, Source) then
+				table.insert(DataSource.Rarities, Source)
+			end
 		end
 	end
-	if #List > 0 then
-		RARITY_ORDER = List
+
+	if ZonesConfig and type(ZonesConfig.Zones) == "table" then
+		for _, Zone in ipairs(ZonesConfig.Zones) do
+			if type(Zone) == "table" then
+				Add(Zone.Rarity, "ZonesConfig")
+			end
+		end
+	end
+
+	-- Folder ReplicatedStorage.Rarities (berisi semua rarity, termasuk Primordial/Abyssal/Godly)
+	local RaritiesFolder = ReplicatedStorage:FindFirstChild("Rarities")
+	if RaritiesFolder then
+		for _, Child in ipairs(RaritiesFolder:GetChildren()) do
+			Add(Child.Name, "RS.Rarities")
+		end
+	end
+
+	if EggRewardsModule and type(EggRewardsModule.RarityColors) == "table" then
+		local Extra = {}
+		for Rarity in pairs(EggRewardsModule.RarityColors) do
+			table.insert(Extra, Rarity)
+		end
+		table.sort(Extra)
+		for _, Rarity in ipairs(Extra) do
+			Add(Rarity, "EggRewards")
+		end
 	end
 end
 
@@ -2542,7 +2544,7 @@ local function ZoneIndex(ZoneId)
 end
 
 local function ZoneName(ZoneId)
-	return ZONE_NAMES[ZoneId] or ZoneId
+	return ZONE_NAMES[ZoneId] or ("Zona " .. ZoneIndex(ZoneId))
 end
 
 local SUFFIX = { K = 1e3, M = 1e6, B = 1e9, T = 1e12, Qa = 1e15, Qi = 1e18, Sx = 1e21, Sp = 1e24 }
@@ -4293,30 +4295,78 @@ local function PromptPosition(Prompt)
 	return nil
 end
 
--- Nama tampilan hewan -> rarity, dari modul game ReplicatedStorage.Shared.EggRewards
-local AnimalRarity = nil
-local function GetAnimalRarity()
-	if AnimalRarity then
-		return AnimalRarity
+-- Nama hewan -> rarity. Sumber: modul EggRewards (semua hewan di game) +
+-- atribut asli hewan di Backpack & base semua pemain (AnimalName / Rarity).
+-- Kunci dinormalkan (huruf kecil, tanpa spasi) supaya "Fangtooth Fish" = "FangtoothFish".
+local function NameKey(Text)
+	return (tostring(Text):lower():gsub("[^%w]", ""))
+end
+
+local AnimalRarity = {}
+local AnimalRarityLoaded = false
+local AnimalRarityCount = 0
+
+local function LearnAnimal(Name, Rarity)
+	if type(Name) == "string" and type(Rarity) == "string" and Rarity ~= "" then
+		local Key = NameKey(Name)
+		if Key ~= "" and not AnimalRarity[Key] then
+			AnimalRarity[Key] = Rarity
+			AnimalRarityCount += 1
+		end
 	end
-	AnimalRarity = {}
-	local EggRewards = SafeRequire(Shared, "EggRewards")
-	if EggRewards and type(EggRewards.Pool) == "table" then
-		for _, Entry in ipairs(EggRewards.Pool) do
-			if type(Entry) == "table" and Entry.Name and Entry.Rarity then
-				local Display = Entry.Name
-				if type(EggRewards.DisplayName) == "function" then
-					local ok, Result = pcall(EggRewards.DisplayName, Entry.Name)
-					if ok and type(Result) == "string" then
-						Display = Result
-					end
-				end
-				AnimalRarity[Display:lower()] = Entry.Rarity
-				AnimalRarity[Entry.Name:lower()] = Entry.Rarity
+end
+
+-- Pelajari dari hewan nyata di game (Tool di Backpack, hewan di base semua pemain)
+local LastLearn = 0
+local function LearnFromWorld()
+	if os.clock() - LastLearn < 5 then
+		return
+	end
+	LastLearn = os.clock()
+	for _, Container in ipairs({ Player:FindFirstChild("Backpack"), Player.Character }) do
+		if Container then
+			for _, Tool in ipairs(Container:GetChildren()) do
+				LearnAnimal(Tool:GetAttribute("AnimalName"), Tool:GetAttribute("Rarity"))
 			end
 		end
 	end
+	local Plots = workspace:FindFirstChild("Plots")
+	if Plots then
+		for _, Plot in ipairs(Plots:GetChildren()) do
+			local Placed = Plot:FindFirstChild("PlacedAnimals")
+			if Placed then
+				for _, Animal in ipairs(Placed:GetChildren()) do
+					LearnAnimal(Animal:GetAttribute("AnimalName") or Animal.Name, Animal:GetAttribute("Rarity"))
+				end
+			end
+		end
+	end
+end
+
+local function GetAnimalRarity()
+	if not AnimalRarityLoaded then
+		AnimalRarityLoaded = true
+		local EggRewards = EggRewardsModule
+		if EggRewards and type(EggRewards.Pool) == "table" then
+			for _, Entry in ipairs(EggRewards.Pool) do
+				if type(Entry) == "table" and Entry.Name and Entry.Rarity then
+					LearnAnimal(Entry.Name, Entry.Rarity)
+					if type(EggRewards.DisplayName) == "function" then
+						local ok, Display = pcall(EggRewards.DisplayName, Entry.Name)
+						if ok then
+							LearnAnimal(Display, Entry.Rarity)
+						end
+					end
+				end
+			end
+		end
+	end
+	LearnFromWorld()
 	return AnimalRarity
+end
+
+local function RarityOfAnimal(Name)
+	return GetAnimalRarity()[NameKey(Name)]
 end
 
 -- ObjectText: '<font color="#4FE8D2"><b>[360Kg]</b></font> Gold Fangtooth Fish'
@@ -4327,15 +4377,14 @@ local function ParseObjectText(Text)
 	local Weight = WeightText and ParseShort((WeightText:gsub("[Kk][Gg]", ""):gsub(",", ""))) or nil
 	local Name = Plain:gsub("%b[]", ""):gsub("^%s+", ""):gsub("%s+$", "")
 
-	local Lookup = GetAnimalRarity()
-	local Rarity, Mutation = Lookup[Name:lower()], nil
+	local Rarity, Mutation = RarityOfAnimal(Name), nil
 	if not Rarity then
 		-- Coba buang kata depan (mutasi), mis. "Gold Fangtooth Fish"
 		local Words = Name:split(" ")
 		for Cut = 1, math.min(2, #Words - 1) do
 			local Rest = table.concat(Words, " ", Cut + 1)
-			if Lookup[Rest:lower()] then
-				Rarity = Lookup[Rest:lower()]
+			if RarityOfAnimal(Rest) then
+				Rarity = RarityOfAnimal(Rest)
 				Mutation = table.concat(Words, " ", 1, Cut)
 				Name = Rest
 				break
@@ -4364,7 +4413,7 @@ local function PromptInfo(Prompt)
 	local Name, Weight, Rarity, Mutation = ParseObjectText(Prompt.ObjectText or "")
 	Info.Name = Info.AnimalName or (Name ~= "" and Name) or "Hewan"
 	Info.WeightKg = Info.WeightKg or Weight
-	Info.Rarity = Info.Rarity or Rarity or GetAnimalRarity()[Info.Name:lower()]
+	Info.Rarity = Info.Rarity or Rarity or RarityOfAnimal(Info.Name)
 	Info.Mutation = Info.Mutation or Mutation
 	return Info
 end
@@ -4825,6 +4874,17 @@ local function DiagnoseText()
 	table.insert(Parts, "Error farm: " .. tostring(LastFarmError or "-"))
 	table.insert(Parts, "Curi terakhir: " .. LastStealResult)
 	table.insert(Parts, "StreamingEnabled: " .. tostring(workspace.StreamingEnabled))
+	-- Sumber data nama (semua dari game)
+	local ZoneCount = 0
+	for _ in pairs(ZONE_NAMES) do
+		ZoneCount += 1
+	end
+	table.insert(Parts, string.format("Nama zona: %s (%d)", DataSource.Zones, ZoneCount))
+	table.insert(Parts, string.format("Rarity: %d dari %s", #RARITY_ORDER, table.concat(DataSource.Rarities, "+")))
+	GetAnimalRarity()
+	table.insert(Parts, "Hewan dikenal: " .. AnimalRarityCount)
+	Check("Modul ZonesConfig", ZonesConfig ~= nil)
+	Check("Modul EggRewards", EggRewardsModule ~= nil)
 	return table.concat(Parts, " | ")
 end
 
