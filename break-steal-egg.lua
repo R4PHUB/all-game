@@ -1,6 +1,6 @@
--- RapHub | break-steal-egg.lua | build 2026-11-25 12:14 WIB
+-- RapHub | break-steal-egg.lua | build 2026-11-25 12:20 WIB
 
-local RAPHUB_BUILD = "2026-11-25 12:14 WIB"
+local RAPHUB_BUILD = "2026-11-25 12:20 WIB"
 local Library = (function()
 --[[
 	RapHub UI v2 — template panel untuk semua game RapHub
@@ -731,22 +731,22 @@ function Library:CreateWindow(Config)
 	local OpenButton = Create("ImageButton", {
 		AnchorPoint = Vector2.new(0.5, 0.5),
 		BackgroundColor3 = Theme.Background,
-		Position = UDim2.new(0, 70, 0, 90),
-		Size = UDim2.fromOffset(52, 52),
+		Position = UDim2.new(0, 60, 0, 80),
+		Size = UDim2.fromOffset(Config.ToggleSize or 40, Config.ToggleSize or 40),
 		Image = Config.Logo or "",
 		ScaleType = Enum.ScaleType.Crop,
 		AutoButtonColor = false,
 		Visible = false,
 	}, ToggleGui)
-	Corner(OpenButton, 26)
-	Stroke(OpenButton, Theme.Accent, 0, 2)
+	Corner(OpenButton, 100)
+	local OpenStroke = Stroke(OpenButton, Theme.Accent, 0.2, 1.5)
 	local OpenLetter = Create("TextLabel", {
 		BackgroundTransparency = 1,
 		Size = UDim2.fromScale(1, 1),
 		Font = Enum.Font.GothamBlack,
 		Text = string.sub(Config.Title or "R", 1, 1),
 		TextColor3 = Theme.Accent,
-		TextSize = 24,
+		TextSize = 18,
 	}, OpenButton)
 
 	local OpenMoved = false
@@ -787,9 +787,19 @@ function Library:CreateWindow(Config)
 		local function Update()
 			LogoLetter.Visible = not Logo.IsLoaded
 			OpenLetter.Visible = not OpenButton.IsLoaded
+			-- Logo sudah berbentuk bulat sendiri: latar & garis tebal tidak diperlukan
+			Logo.BackgroundTransparency = Logo.IsLoaded and 1 or 0
+			OpenButton.BackgroundTransparency = OpenButton.IsLoaded and 1 or 0
+			OpenStroke.Transparency = OpenButton.IsLoaded and 0.6 or 0.2
 		end
 		Connect(Logo:GetPropertyChangedSignal("IsLoaded"), Update)
 		Connect(OpenButton:GetPropertyChangedSignal("IsLoaded"), Update)
+		task.spawn(function()
+			pcall(function()
+				game:GetService("ContentProvider"):PreloadAsync({ Logo, OpenButton })
+			end)
+			Update()
+		end)
 		task.delay(2, Update)
 		Update()
 	end
@@ -1608,7 +1618,9 @@ local Player = Players.LocalPlayer
 local Settings = {
 	TeleportMode = "Instant (Lynx)", -- "Instant (Lynx)" | "Jalan (Aman)"
 	StepSize = 28, -- stud per frame untuk lompat jarak dekat (Lynx ~28)
-	ShortRange = 250, -- di atas jarak ini pakai respawn teleport (Lynx lompat ~250 stud)
+	ShortRange = 250, -- jarak satu kali lompat beruntun (Lynx lompat ~250 stud)
+	LongTravel = "Hop", -- jarak jauh: "Hop" (lompat bertahap, tanpa mati) | "Respawn" (paling cepat)
+	HopRest = 0.7, -- jeda antar lompatan bertahap (detik)
 	NoFling = true, -- tidak terpental saat ditangkap guard
 	WalkMultiplier = 1, -- pengali WalkSpeed untuk mode Jalan (Aman)
 	TweenSpeed = 300, -- stud per detik
@@ -1931,7 +1943,7 @@ local MoveNotify -- diisi setelah fungsi Notify ada
 	ledakan pendek (~250 stud). Kalau server menarik balik sekali saja,
 	langsung berhenti (mengulang terus = diledakkan anti-cheat).
 ]]
-local function StepTo(TargetCFrame, Token)
+local function StepTo(TargetCFrame, Token, Quiet)
 	local Root, Humanoid = GetRoot(), GetHumanoid()
 	if not Root or not Humanoid then
 		return false
@@ -1949,7 +1961,7 @@ local function StepTo(TargetCFrame, Token)
 		local Pos = Root.Position
 		if Expected and (Pos - Expected).Magnitude > 40 then
 			LastMoveProblem = "Lompat ditarik balik server"
-			if PullBackWarning then
+			if PullBackWarning and not Quiet then
 				PullBackWarning()
 			end
 			return false
@@ -2046,6 +2058,48 @@ local function IsCarrying()
 	return Player:GetAttribute("Carrying") ~= nil
 end
 
+--[[
+	Lompat bertahap (jarak jauh TANPA respawn): lompat ~ShortRange stud (ledakan
+	pendek seperti Lynx), berhenti sebentar, ulangi sampai tiba. Ditarik balik ->
+	jeda diperpanjang; 3x ditarik balik -> menyerah (pemanggil pakai cadangan).
+]]
+local function HopTo(TargetCFrame, Token)
+	local Rest, PullBacks = Settings.HopRest, 0
+	while Token == MoveToken do
+		local Root = GetRoot()
+		if not Root then
+			return false
+		end
+		local Target = TargetCFrame.Position
+		local Flat = Vector3.new(Target.X - Root.Position.X, 0, Target.Z - Root.Position.Z)
+		if Flat.Magnitude <= Settings.ShortRange then
+			return StepTo(TargetCFrame, Token, true)
+		end
+
+		local Humanoid = GetHumanoid()
+		local HipOffset = (Humanoid and Humanoid.HipHeight or 2) + Root.Size.Y / 2
+		local Mid = Root.Position + Flat.Unit * Settings.ShortRange
+		local Ground = GroundAt(Mid.X, Mid.Z, Root.Position.Y + 25)
+		Mid = Vector3.new(Mid.X, Ground.Y + HipOffset, Mid.Z)
+		local Segment = CFrame.lookAt(Mid, Mid + Flat.Unit)
+		if StepTo(Segment, Token, true) then
+			task.wait(Rest)
+		else
+			if Token ~= MoveToken then
+				return false
+			end
+			PullBacks += 1
+			if PullBacks >= 3 then
+				LastMoveProblem = "Lompat bertahap ditarik balik 3x"
+				return false
+			end
+			Rest *= 1.6
+			task.wait(Rest)
+		end
+	end
+	return false
+end
+
 local function TeleportTo(TargetCFrame)
 	local Root = GetRoot()
 	if not Root or not TargetCFrame then
@@ -2065,7 +2119,7 @@ local function TeleportTo(TargetCFrame)
 		return WalkTo(TargetCFrame, Token)
 	end
 
-	-- "Instant (Lynx)": dekat = lompat kecil, jauh = respawn teleport
+	-- "Instant": dekat = lompat kecil, jauh = lompat bertahap (tanpa mati) atau respawn teleport
 	local Distance = (Root.Position - TargetCFrame.Position).Magnitude
 	if Distance <= Settings.ShortRange then
 		return StepTo(TargetCFrame, Token)
@@ -2073,6 +2127,15 @@ local function TeleportTo(TargetCFrame)
 	if IsCarrying() then
 		-- Jangan mati saat membawa hewan; jalan biasa (tidak dideteksi)
 		return WalkTo(TargetCFrame, Token)
+	end
+	if Settings.LongTravel == "Hop" then
+		if HopTo(TargetCFrame, Token) then
+			return true
+		end
+		if Token ~= MoveToken then
+			return false
+		end
+		-- Lompat bertahap gagal terus: cadangan respawn teleport
 	end
 	return RespawnTo(TargetCFrame, Token)
 end
@@ -3280,8 +3343,18 @@ MoveSection:Slider({
 	end,
 })
 
+MoveSection:Dropdown({
+	Title = "Long Distance Travel",
+	Options = { "Hop (No Respawn)", "Respawn (Fastest)" },
+	Default = "Hop (No Respawn)",
+	Flag = "LongTravel",
+	Callback = function(Value)
+		Settings.LongTravel = Value == "Respawn (Fastest)" and "Respawn" or "Hop"
+	end,
+})
+
 MoveSection:Slider({
-	Title = "Short Hop Range",
+	Title = "Hop Burst Distance",
 	Min = 50,
 	Max = 400,
 	Default = Settings.ShortRange,
@@ -3290,6 +3363,19 @@ MoveSection:Slider({
 	Flag = "ShortRange",
 	Callback = function(Value)
 		Settings.ShortRange = Value
+	end,
+})
+
+MoveSection:Slider({
+	Title = "Hop Rest",
+	Min = 0.2,
+	Max = 3,
+	Default = Settings.HopRest,
+	Increment = 0.1,
+	Suffix = "s",
+	Flag = "HopRest",
+	Callback = function(Value)
+		Settings.HopRest = Value
 	end,
 })
 
@@ -4582,7 +4668,7 @@ end
 LogDiagnostics = function()
 	FarmLog("=== MULAI === versi " .. tostring(RAPHUB_BUILD or "dev") .. " | " .. DiagnoseText())
 	FarmLog(string.format(
-		"Setelan: mode gerak %s | cara pukul %s | setor %s | zona %s | auto zona terbaik %s (%s) | speed %s",
+		"Setelan: mode gerak %s (jauh: " .. tostring(Settings.LongTravel) .. ") | cara pukul %s | setor %s | zona %s | auto zona terbaik %s (%s) | speed %s",
 		Settings.TeleportMode,
 		Farm.HitMode,
 		Farm.BankMode,
