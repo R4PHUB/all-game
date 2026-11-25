@@ -1,6 +1,6 @@
--- RapHub | break-steal-egg.lua | build 2026-11-25 12:30 WIB
+-- RapHub | break-steal-egg.lua | build 2026-11-25 12:35 WIB
 
-local RAPHUB_BUILD = "2026-11-25 12:30 WIB"
+local RAPHUB_BUILD = "2026-11-25 12:35 WIB"
 local Library = (function()
 --[[
 	RapHub UI v2 — template panel untuk semua game RapHub
@@ -1742,7 +1742,7 @@ local Settings = {
 	TeleportMode = "Instant (Lynx)", -- "Instant (Lynx)" | "Jalan (Aman)"
 	StepSize = 28, -- stud per frame untuk lompat jarak dekat (Lynx ~28)
 	ShortRange = 250, -- jarak satu kali lompat beruntun (Lynx lompat ~250 stud)
-	LongTravel = "Hop", -- jarak jauh: "Hop" (lompat bertahap, tanpa mati) | "Respawn" (paling cepat)
+	LongTravel = "Respawn", -- jarak jauh: "Respawn" (terbukti tidak ditarik balik) | "Hop" (eksperimen, sering ditarik balik)
 	HopRest = 0.7, -- jeda antar lompatan bertahap (detik)
 	NoFling = true, -- tidak terpental saat ditangkap guard
 	WalkMultiplier = 1, -- pengali WalkSpeed untuk mode Jalan (Aman)
@@ -2060,6 +2060,21 @@ end
 
 local LastMoveProblem = nil -- ditampilkan di panel Diagnosa
 local MoveNotify -- diisi setelah fungsi Notify ada
+local MoveLog -- diisi setelah FarmLog ada (catatan perjalanan jauh)
+
+-- Sembunyikan/tampilkan karakter hanya di layar kita (LocalTransparencyModifier)
+local function SetCharacterHidden(Character, Hidden)
+	if not Character then
+		return
+	end
+	for _, D in ipairs(Character:GetDescendants()) do
+		if D:IsA("BasePart") or D:IsA("Decal") then
+			D.LocalTransparencyModifier = Hidden and 1 or 0
+		elseif D:IsA("Sound") and Hidden then
+			D.Volume = 0
+		end
+	end
+end
 
 --[[
 	Lompat kecil per frame (jarak DEKAT saja). Lynx hanya memakai ini untuk
@@ -2132,9 +2147,18 @@ local function RespawnTo(TargetCFrame, Token)
 	Respawning = true
 
 	local Arrived = false
+	local Distance = (Root.Position - TargetCFrame.Position).Magnitude
 	local Conn = Player.CharacterAdded:Connect(function(Character)
+		-- Karakter baru disembunyikan sampai sudah berdiri di tujuan (tidak terlihat "muncul di base")
+		local HideConn = Character.DescendantAdded:Connect(function(D)
+			if D:IsA("BasePart") or D:IsA("Decal") then
+				D.LocalTransparencyModifier = 1
+			end
+		end)
+		SetCharacterHidden(Character, true)
 		local NewRoot = Character:WaitForChild("HumanoidRootPart", 5)
 		if not NewRoot then
+			HideConn:Disconnect()
 			return
 		end
 		-- Tahan di tujuan selama frame-frame awal karakter baru
@@ -2144,13 +2168,20 @@ local function RespawnTo(TargetCFrame, Token)
 			NewRoot.AssemblyLinearVelocity = Vector3.zero
 			RunService.Heartbeat:Wait()
 		end
+		HideConn:Disconnect()
+		SetCharacterHidden(Character, false)
 		Arrived = true
 	end)
 
+	-- Karakter lama disembunyikan & dibisukan dulu, jadi kematiannya tidak terlihat
+	pcall(SetCharacterHidden, Player.Character, true)
 	pcall(function()
 		Root.Anchored = true
 		Humanoid.Health = 0
 	end)
+	if MoveLog then
+		MoveLog(string.format("Teleport jauh (respawn) %.0f stud", Distance))
+	end
 
 	local Started = os.clock()
 	while not Arrived and Token == MoveToken and os.clock() - Started < 12 do
@@ -2172,7 +2203,13 @@ local function RespawnTo(TargetCFrame, Token)
 		if MoveNotify then
 			MoveNotify("Respawn teleport ditarik balik server.")
 		end
+		if MoveLog then
+			MoveLog("Respawn teleport DITARIK BALIK")
+		end
 		return false
+	end
+	if MoveLog then
+		MoveLog("Respawn teleport berhasil, posisi bertahan")
 	end
 	return true
 end
@@ -2212,6 +2249,9 @@ local function HopTo(TargetCFrame, Token)
 				return false
 			end
 			PullBacks += 1
+			if MoveLog then
+				MoveLog("Lompat bertahap ditarik balik (" .. PullBacks .. "/3)")
+			end
 			if PullBacks >= 3 then
 				LastMoveProblem = "Lompat bertahap ditarik balik 3x"
 				return false
@@ -3027,6 +3067,8 @@ local FarmSection = MainTab:Section({ Title = "Auto Farm Eggs", Open = true })
 
 local FarmStatus = FarmSection:Paragraph({ Title = "Status", Content = "Off" })
 
+MoveLog = FarmLog
+
 local LastStatus = ""
 local function SetStatus(Text)
 	if Text ~= LastStatus then
@@ -3469,11 +3511,11 @@ MoveSection:Slider({
 
 MoveSection:Dropdown({
 	Title = "Long Distance Travel",
-	Options = { "Hop (No Respawn)", "Respawn (Fastest)" },
-	Default = "Hop (No Respawn)",
+	Options = { "Respawn (Hidden, Fastest)", "Hop (Experimental)" },
+	Default = "Respawn (Hidden, Fastest)",
 	Flag = "LongTravel",
 	Callback = function(Value)
-		Settings.LongTravel = Value == "Respawn (Fastest)" and "Respawn" or "Hop"
+		Settings.LongTravel = Value == "Hop (Experimental)" and "Hop" or "Respawn"
 	end,
 })
 
