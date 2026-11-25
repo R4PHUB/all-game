@@ -3374,15 +3374,28 @@ local function BestZoneId()
 	return Best or "Zone1"
 end
 
+local ZoneEmptyUntil = {} -- nomor zona -> os.clock() sampai kapan dianggap kosong
+
+-- Nomor zona tertinggi yang boleh dipakai: Speed cukup & tidak sedang ditandai kosong
+local function BestZoneIndex()
+	local Index = ZoneIndex(BestZoneId())
+	while Index > 1 and ZoneEmptyUntil[Index] and os.clock() < ZoneEmptyUntil[Index] do
+		Index -= 1
+	end
+	return Index
+end
+
 local TooStrong = {} -- nama telur -> os.clock() sampai kapan dilewati
-local CurrentBestZone = nil
+local CurrentBestIndex = nil
+local LastPickStats = "" -- alasan kalau tidak ada telur cocok (untuk status & log)
 
 local function FarmFilter(Egg)
 	if #Farm.Zones > 0 then
 		if not table.find(Farm.Zones, ZoneName(Egg.ZoneId)) then
 			return false
 		end
-	elseif Farm.AutoBestZone and CurrentBestZone and Egg.ZoneId ~= CurrentBestZone then
+	elseif Farm.AutoBestZone and CurrentBestIndex and ZoneIndex(Egg.ZoneId) > CurrentBestIndex then
+		-- Zona di atas kemampuan Speed: dilewati
 		return false
 	end
 	if TooStrong[Egg.Name] and os.clock() < TooStrong[Egg.Name] then
@@ -3411,18 +3424,47 @@ local function FarmScore(Egg)
 	return Distance(Egg)
 end
 
+--[[
+	Urutan pilihan telur:
+	  1. Titanic dulu (kalau aktif)
+	  2. Auto Zona Terbaik: zona TERTINGGI yang Speed cukup DAN sedang ada telurnya
+	     (zona teratas kosong -> otomatis turun ke zona di bawahnya)
+	  3. Prioritas (terdekat / luck / berat / HP)
+]]
 local function PickFarmEgg(Skip)
-	CurrentBestZone = BestZoneId()
-	local Best, BestRank, BestScore = nil, nil, nil
+	CurrentBestIndex = BestZoneIndex()
+	local UseZoneRank = Farm.AutoBestZone and #Farm.Zones == 0
+	local Best, BestRank, BestZone, BestScore = nil, nil, nil, nil
+	local Total, Passed, Skipped = 0, 0, 0
+
 	for _, Egg in ipairs(CollectEggs()) do
-		if FarmFilter(Egg) and not Skip[Egg.Model] then
-			local Rank = (Farm.TitanicFirst and Egg.Name:lower():find("titanic")) and 0 or 1
-			local Score = FarmScore(Egg)
-			if not Best or Rank < BestRank or (Rank == BestRank and Score < BestScore) then
-				Best, BestRank, BestScore = Egg, Rank, Score
+		Total += 1
+		if FarmFilter(Egg) then
+			Passed += 1
+			if Skip[Egg.Model] then
+				Skipped += 1
+			else
+				local Rank = (Farm.TitanicFirst and Egg.Name:lower():find("titanic")) and 0 or 1
+				local Zone = UseZoneRank and -ZoneIndex(Egg.ZoneId) or 0
+				local Score = FarmScore(Egg)
+				local Better = not Best
+					or Rank < BestRank
+					or (Rank == BestRank and Zone < BestZone)
+					or (Rank == BestRank and Zone == BestZone and Score < BestScore)
+				if Better then
+					Best, BestRank, BestZone, BestScore = Egg, Rank, Zone, Score
+				end
 			end
 		end
 	end
+
+	LastPickStats = string.format(
+		"%d telur di map, %d lolos filter, %d dilewati sementara%s",
+		Total,
+		Passed,
+		Skipped,
+		UseZoneRank and (" | zona maks: " .. ZoneName("Zone" .. CurrentBestIndex)) or ""
+	)
 	return Best
 end
 
@@ -4667,7 +4709,69 @@ end)
 local LastFarmError = nil
 local FarmSkip = setmetatable({}, { __mode = "k" })
 local NoDamageStreak = 0
+local EnsureBestZoneLoaded -- didefinisikan di bawah
 local LogDiagnostics -- diisi setelah DiagnoseText ada
+
+-- Jumlah telur lolos filter di satu zona (yang sudah termuat di client)
+local function CountEggsInZone(Index)
+	local Count = 0
+	for _, Egg in ipairs(CollectEggs()) do
+		if ZoneIndex(Egg.ZoneId) == Index and FarmFilter(Egg) then
+			Count += 1
+		end
+	end
+	return Count
+end
+
+-- Minta server mengirim isi zona (game memakai streaming: zona jauh tidak dimuat)
+local function StreamZone(Index)
+	local Build = GetBuild()
+	local Hitboxes = Build and Build:FindFirstChild("ZoneHitboxes")
+	local Box = Hitboxes and Hitboxes:FindFirstChild(tostring(Index))
+	if not Box or not Box:IsA("BasePart") then
+		return
+	end
+	local Points = math.max(1, math.ceil(Box.Size.X / 200))
+	for i = 1, Points do
+		local X = Box.Position.X - Box.Size.X / 2 + (i - 0.5) * (Box.Size.X / Points)
+		pcall(function()
+			Player:RequestStreamAroundAsync(Vector3.new(X, 5, Box.Position.Z), 2)
+		end)
+	end
+end
+
+-- Zona terbaik belum terlihat telurnya: muat dulu, kalau perlu datangi.
+-- Tetap kosong -> tandai kosong 90 detik, farm turun ke zona di bawahnya.
+EnsureBestZoneLoaded = function()
+	CurrentBestIndex = BestZoneIndex()
+	local Index = CurrentBestIndex
+	if CountEggsInZone(Index) > 0 then
+		return
+	end
+
+	local Label = ZoneName("Zone" .. Index)
+	SetStatus("Memuat " .. Label .. "...")
+	StreamZone(Index)
+	task.wait(0.5)
+	if CountEggsInZone(Index) > 0 then
+		FarmLog(Label .. " termuat lewat streaming")
+		return
+	end
+
+	SetStatus("Menuju " .. Label .. " (telur belum termuat)")
+	local Target = ZoneTargetCFrame("Zone" .. Index)
+	if Target and TeleportTo(Target) then
+		task.wait(2)
+		if CountEggsInZone(Index) > 0 then
+			FarmLog(Label .. " termuat setelah didatangi")
+			return
+		end
+	end
+
+	ZoneEmptyUntil[Index] = os.clock() + 90
+	FarmLog(Label .. " tidak ada telur yang cocok, turun ke zona bawahnya selama 90 dtk")
+	CurrentBestIndex = BestZoneIndex()
+end
 
 local function FarmStep()
 	if IsJailed() then
@@ -4706,13 +4810,17 @@ local function FarmStep()
 		return
 	end
 
+	if Farm.AutoBestZone and #Farm.Zones == 0 then
+		EnsureBestZoneLoaded()
+	end
+
 	local Egg = PickFarmEgg(FarmSkip)
 	if not Egg then
 		if Farm.ReturnWhenFull and CarryCount() > 0 then
 			Bank()
 			return
 		end
-		SetStatus("Menunggu telur yang cocok...")
+		SetStatus("Menunggu telur yang cocok (" .. LastPickStats .. ")")
 		table.clear(FarmSkip)
 		task.wait(1)
 		return
