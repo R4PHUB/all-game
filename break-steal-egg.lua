@@ -1,6 +1,6 @@
--- RapHub | break-steal-egg.lua | build 2026-11-25 11:11 WIB
+-- RapHub | break-steal-egg.lua | build 2026-11-25 11:17 WIB
 
-local RAPHUB_BUILD = "2026-11-25 11:11 WIB"
+local RAPHUB_BUILD = "2026-11-25 11:17 WIB"
 local Library = (function()
 local Players = game:GetService("Players")
 local Player = Players.LocalPlayer
@@ -4324,6 +4324,8 @@ local function NearestDropPrompt(MaxDist)
 	return Best
 end
 
+local ChainInFling -- ambil berantai selama fling window (diisi di bagian auto steal)
+
 local function BankViaGuard()
 	local Root = GetRoot()
 	local Spot = SafeSpot()
@@ -4394,21 +4396,45 @@ local function BankViaGuard()
 		while CarryCount() > 0 and os.clock() - BankStart < 1.2 do
 			task.wait(0.05)
 		end
+		FarmLog(CarryCount() == 0 and "Setor berhasil di SafeZone" or "Setor gagal: hewan masih dibawa setelah di SafeZone")
+	elseif CarryCount() == 0 then
+		FarmLog("Ditangkap guard tapi hewan tidak bisa diambil lagi (hilang)")
+	else
+		FarmLog("Fling window habis sebelum sempat ke SafeZone")
 	end
 
 	-- 4. Kembali ke tempat farm (masih fling window = teleport langsung)
 	EquipPickaxe()
 	TeleportTo(ReturnTo)
+
+	-- 5. Sisa fling window: ambil hewan berikutnya & setor lagi (cara Lynx)
+	if ChainInFling and InFlingWindow() then
+		ChainInFling(Spot, ReturnTo)
+	end
 	return true
 end
 
 local function Bank()
 	if Farm.BankMode == "Lewat Guard (Cepat)" then
-		if BankViaGuard() then
-			-- Sesekali pulang ke base untuk menaruh hewan
-			if Place.Auto and #AnimalTools() >= Place.Every then
-				BankAndPlace()
+		-- Guard bisa punya jeda sebelum menangkap lagi: coba sampai 3x
+		for Try = 1, 3 do
+			if CarryCount() == 0 then
+				return
 			end
+			if BankViaGuard() then
+				-- Sesekali pulang ke base untuk menaruh hewan
+				if Place.Auto and #AnimalTools() >= Place.Every then
+					BankAndPlace()
+				end
+				return
+			end
+			FarmLog(string.format("Guard tidak menangkap (percobaan %d/3)", Try))
+			if Try < 3 then
+				task.wait(2)
+			end
+		end
+		if CarryCount() == 0 then
+			FarmLog("Hewan sudah tidak dibawa, tidak perlu pulang")
 			return
 		end
 		SetStatus("Guard tidak menangkap, setor jalan ke base...")
@@ -4694,6 +4720,62 @@ end
 
 local LastStealResult = "-"
 
+-- Selama fling window masih ada: ambil hewan terdekat -> SafeZone -> balik, berulang
+ChainInFling = function(Spot, ReturnTo)
+	local Cfg = (Farm.Enabled and Farm.PickAnimals) and FarmAnimalConfig() or (Steal.Enabled and Steal) or nil
+	if not Cfg then
+		return
+	end
+	local Count = 0
+	while InFlingWindow() and Working() and CarryCount() < SatchelCapacity() do
+		local Target = StealTargets(Cfg)[1]
+		if not Target or Target.Distance > 200 then
+			break
+		end
+		local Root = GetRoot()
+		local Anchor = Target.Prompt.Parent
+		if not Root or not Anchor or not Anchor:IsA("BasePart") then
+			break
+		end
+
+		Root.CFrame = StandAt(Anchor.Position)
+		Root.AssemblyLinearVelocity = Vector3.zero
+		local Before, Started, Attempt = CarryCount(), os.clock(), 0
+		while CarryCount() <= Before and os.clock() - Started < 0.8 and InFlingWindow() and Target.Prompt.Parent do
+			Attempt += 1
+			FirePrompt(Target.Prompt, Attempt)
+			task.wait(0.05)
+		end
+		if CarryCount() <= Before then
+			StealSkip[Target.Prompt] = true
+			break
+		end
+		Count += 1
+		FarmLog("Ambil berantai (fling window): " .. Target.Name)
+		if not InFlingWindow() then
+			break -- dibawa, nanti disetor di langkah berikutnya
+		end
+
+		Root = GetRoot()
+		if Root then
+			Root.CFrame = Spot
+			Root.AssemblyLinearVelocity = Vector3.zero
+		end
+		local BankStart = os.clock()
+		while CarryCount() > 0 and os.clock() - BankStart < 1 do
+			task.wait(0.05)
+		end
+		Root = GetRoot()
+		if Root then
+			Root.CFrame = ReturnTo
+			Root.AssemblyLinearVelocity = Vector3.zero
+		end
+	end
+	if Count > 0 then
+		FarmLog(string.format("Rantai fling window: %d hewan", Count))
+	end
+end
+
 -- Datangi prompt, tekan sampai hewan terbawa (CarryCount naik)
 local function StealOne(Info)
 	local Label = Info.Name .. (Info.Rarity and (" [" .. tostring(Info.Rarity) .. "]") or "")
@@ -4725,6 +4807,7 @@ local function StealOne(Info)
 
 	if CarryCount() > Before then
 		LastStealResult = "Berhasil: " .. Label .. " (" .. Method .. ")"
+		FarmLog(LastStealResult)
 		return true
 	end
 
@@ -4737,6 +4820,7 @@ local function StealOne(Info)
 		Root and (Target - Root.Position).Magnitude or -1,
 		Info.Prompt.Parent and (Info.Prompt.Enabled and "aktif" or "nonaktif") or "hilang"
 	)
+	FarmLog(LastStealResult)
 	StealSkip[Info.Prompt] = true
 	return false
 end
@@ -5089,6 +5173,46 @@ local function FarmStep()
 
 	if not EggAlive(Egg) then
 		FarmLog("Telur pecah: " .. Label .. " | bawa " .. CarryCount() .. "/" .. SatchelCapacity())
+	end
+end
+
+-- Catat kejadian penting dari server ke FarmLog (anti-cheat, setor, bawa/lepas hewan)
+do
+	local NotifyRemote = ReplicatedStorage:FindFirstChild("Notify")
+	if NotifyRemote and NotifyRemote:IsA("RemoteEvent") then
+		NotifyRemote.OnClientEvent:Connect(function(Text, Kind)
+			if Working() and type(Text) == "string" then
+				FarmLog("Server [" .. tostring(Kind) .. "]: " .. Text:gsub("<[^>]->", ""))
+			end
+		end)
+	end
+	local Banked = ReplicatedStorage:FindFirstChild("AnimalBankedRemote")
+	if Banked and Banked:IsA("RemoteEvent") then
+		Banked.OnClientEvent:Connect(function(List)
+			if Working() and type(List) == "table" then
+				local Names = {}
+				for _, Item in ipairs(List) do
+					if type(Item) == "table" then
+						table.insert(Names, tostring(Item.Name) .. (Item.Variant and (" (" .. tostring(Item.Variant) .. ")") or ""))
+					end
+				end
+				FarmLog("TERSIMPAN: " .. table.concat(Names, ", "))
+			end
+		end)
+	end
+	Player:GetAttributeChangedSignal("Carrying"):Connect(function()
+		if Working() then
+			local Name = Player:GetAttribute("Carrying")
+			FarmLog(Name and ("Membawa: " .. tostring(Name) .. " [" .. tostring(Player:GetAttribute("CarryingRarity")) .. "]") or "Tidak membawa hewan lagi")
+		end
+	end)
+	local CatchFling = ReplicatedStorage:FindFirstChild("CatchFlingRemote")
+	if CatchFling and CatchFling:IsA("RemoteEvent") then
+		CatchFling.OnClientEvent:Connect(function(Kind)
+			if Working() then
+				FarmLog("Guard: " .. tostring(Kind))
+			end
+		end)
 	end
 end
 
