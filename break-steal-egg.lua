@@ -1,6 +1,6 @@
--- RapHub | break-steal-egg.lua | build 2026-11-25 12:35 WIB
+-- RapHub | break-steal-egg.lua | build 2026-11-25 12:39 WIB
 
-local RAPHUB_BUILD = "2026-11-25 12:35 WIB"
+local RAPHUB_BUILD = "2026-11-25 12:39 WIB"
 local Library = (function()
 --[[
 	RapHub UI v2 — template panel untuk semua game RapHub
@@ -1739,9 +1739,9 @@ local Player = Players.LocalPlayer
 -- Setting
 ---------------------------------------------------------------------
 local Settings = {
-	TeleportMode = "Instant (Lynx)", -- "Instant (Lynx)" | "Jalan (Aman)"
-	StepSize = 28, -- stud per frame untuk lompat jarak dekat (Lynx ~28)
-	ShortRange = 250, -- jarak satu kali lompat beruntun (Lynx lompat ~250 stud)
+	TeleportMode = "Instant", -- "Instant" | "Jalan (Aman)"
+	StepSize = 28, -- stud per frame untuk lompat jarak dekat
+	ShortRange = 250, -- jarak satu kali lompat beruntun
 	LongTravel = "Respawn", -- jarak jauh: "Respawn" (terbukti tidak ditarik balik) | "Hop" (eksperimen, sering ditarik balik)
 	HopRest = 0.7, -- jeda antar lompatan bertahap (detik)
 	NoFling = true, -- tidak terpental saat ditangkap guard
@@ -1988,7 +1988,7 @@ end
 --[[
 	Fling window: saat ditangkap guard, server mengirim CatchFlingRemote "fling"
 	sampai "release" (~3 detik). Selama itu anti-cheat tidak memeriksa posisi,
-	jadi teleport jarak berapa pun aman (cara yang dipakai Lynx).
+	jadi teleport jarak berapa pun aman.
 ]]
 local Fling = { Until = 0, Count = 0, Active = false, Hold = nil }
 do
@@ -2077,7 +2077,7 @@ local function SetCharacterHidden(Character, Hidden)
 end
 
 --[[
-	Lompat kecil per frame (jarak DEKAT saja). Lynx hanya memakai ini untuk
+	Lompat kecil per frame (jarak DEKAT saja). Hanya aman untuk
 	ledakan pendek (~250 stud). Kalau server menarik balik sekali saja,
 	langsung berhenti (mengulang terus = diledakkan anti-cheat).
 ]]
@@ -2132,7 +2132,7 @@ local function StepTo(TargetCFrame, Token, Quiet)
 end
 
 --[[
-	Respawn Teleport (jarak JAUH, cara Lynx dari rekaman):
+	Respawn Teleport (jarak JAUH, terbukti dari rekaman):
 	HRP di-anchor -> karakter dimatikan -> begitu karakter baru muncul,
 	langsung dipindah ke tujuan pada frame-frame pertama, sebelum anti-cheat
 	server mulai mengawasi karakter baru. Tidak dipakai saat membawa hewan
@@ -2220,7 +2220,7 @@ end
 
 --[[
 	Lompat bertahap (jarak jauh TANPA respawn): lompat ~ShortRange stud (ledakan
-	pendek seperti Lynx), berhenti sebentar, ulangi sampai tiba. Ditarik balik ->
+	pendek), berhenti sebentar, ulangi sampai tiba. Ditarik balik ->
 	jeda diperpanjang; 3x ditarik balik -> menyerah (pemanggil pakai cadangan).
 ]]
 local function HopTo(TargetCFrame, Token)
@@ -3042,9 +3042,9 @@ local function FarmLog(Text)
 	end
 end
 
--- Nilai label dropdown (Inggris, seperti Lynx) -> nilai internal script
+-- Nilai label dropdown -> nilai internal script
 local PRIORITY = { Nearest = "Terdekat", ["Highest Luck"] = "Luck Tertinggi", ["Biggest Size"] = "Terberat", ["Lowest HP"] = "HP Terendah" }
-local MOVE_MODE = { ["Instant (Faster)"] = "Instant (Lynx)", ["Walk (Safe)"] = "Jalan (Aman)" }
+local MOVE_MODE = { ["Instant (Faster)"] = "Instant", ["Walk (Safe)"] = "Jalan (Aman)" }
 local BANK_MODE = { ["Guard Catch (Fast)"] = "Lewat Guard (Cepat)", ["Walk to Base"] = "Jalan ke Base" }
 local HIT_MODE = { ["Game Swing"] = "Swing Game (Aman)", ["Virtual Click"] = "Klik Virtual" }
 
@@ -3155,7 +3155,7 @@ FarmSection:Dropdown({
 	Default = "Instant (Faster)",
 	Flag = "FarmMode",
 	Callback = function(Value)
-		Settings.TeleportMode = MOVE_MODE[Value] or "Instant (Lynx)"
+		Settings.TeleportMode = MOVE_MODE[Value] or "Instant"
 	end,
 })
 
@@ -3700,7 +3700,7 @@ local function BankAndPlace()
 end
 
 ---------------------------------------------------------------------
--- Setor lewat guard (cara Lynx): ditangkap guard -> fling window ->
+-- Setor lewat guard: ditangkap guard -> fling window ->
 -- ambil lagi hewan -> teleport ke SafeZone -> tersimpan -> teleport balik
 ---------------------------------------------------------------------
 local function SafeSpot()
@@ -3710,7 +3710,7 @@ local function SafeSpot()
 	if not Safe or not Safe:IsA("BasePart") then
 		return nil
 	end
-	-- Tepi SafeZone dari arah zona + 7 stud (titik yang sama dipakai Lynx: x = -73)
+	-- Tepi SafeZone dari arah zona + 7 stud (x = -73 di map ini)
 	local Edge = Safe.CFrame:PointToWorldSpace(Vector3.new(-Safe.Size.X / 2 + 7, 0, 0))
 	local Ground = GroundAt(Edge.X, 1, 20)
 	return CFrame.new(Ground + Vector3.new(0, 3.5, 0))
@@ -3870,7 +3870,7 @@ local function BankViaGuard()
 	EquipPickaxe()
 	TeleportTo(ReturnTo)
 
-	-- 5. Sisa fling window: ambil hewan berikutnya & setor lagi (cara Lynx)
+	-- 5. Sisa fling window: ambil hewan berikutnya & setor lagi
 	if ChainInFling and InFlingWindow() then
 		ChainInFling(Spot, ReturnTo)
 	end
@@ -4712,6 +4712,24 @@ end
 
 -- Catat kejadian penting dari server ke FarmLog (anti-cheat, setor, bawa/lepas hewan)
 do
+	-- Error & warning di console (F9) ikut dicatat; pesan sama maksimal sekali per 10 detik
+	local LastSeen = {}
+	game:GetService("LogService").MessageOut:Connect(function(Message, Kind)
+		if not Working() then
+			return
+		end
+		if Kind ~= Enum.MessageType.MessageError and Kind ~= Enum.MessageType.MessageWarning then
+			return
+		end
+		local Key = Message:sub(1, 120)
+		if LastSeen[Key] and os.clock() - LastSeen[Key] < 10 then
+			return
+		end
+		LastSeen[Key] = os.clock()
+		local Label = Kind == Enum.MessageType.MessageError and "CONSOLE ERROR" or "CONSOLE WARN"
+		FarmLog(Label .. ": " .. Message:sub(1, 300))
+	end)
+
 	local NotifyRemote = ReplicatedStorage:FindFirstChild("Notify")
 	if NotifyRemote and NotifyRemote:IsA("RemoteEvent") then
 		NotifyRemote.OnClientEvent:Connect(function(Text, Kind)
@@ -4750,16 +4768,19 @@ do
 	end
 end
 
--- Simpan log farm ke file tiap 10 detik saat aktif
+-- Simpan log farm ke file setiap ada baris baru (dicek tiap 5 detik)
 task.spawn(function()
 	pcall(function()
 		if makefolder and not (isfolder and isfolder("RapHub")) then
 			makefolder("RapHub")
 		end
 	end)
+	local LastSaved = ""
 	while not Library.Unloaded do
-		task.wait(10)
-		if Working() and writefile and #FarmLogLines > 0 then
+		task.wait(5)
+		local Last = FarmLogLines[#FarmLogLines] or ""
+		if writefile and #FarmLogLines > 0 and Last ~= LastSaved then
+			LastSaved = Last
 			pcall(writefile, "RapHub/FarmLog.txt", table.concat(FarmLogLines, "\n"))
 		end
 	end
