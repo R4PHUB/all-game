@@ -1,5 +1,6 @@
--- RapHub | break-steal-egg.lua
+-- RapHub | break-steal-egg.lua | build 2026-11-25 11:00 WIB
 
+local RAPHUB_BUILD = "2026-11-25 11:00 WIB"
 local Library = (function()
 local Players = game:GetService("Players")
 local Player = Players.LocalPlayer
@@ -2979,14 +2980,47 @@ local function EggKey(Egg)
 	return string.format("%s [%s] - %s", Egg.Name, Egg.Rarity, ZoneName(Egg.ZoneId))
 end
 
-local function AllEggNames()
-	local Seen, List = {}, {}
-	for _, Egg in ipairs(CollectEggs()) do
-		if not Seen[Egg.Name] then
-			Seen[Egg.Name] = true
-			table.insert(List, Egg.Name)
+-- Kunci nama yang dinormalkan: "PhoenixEgg" = "Phoenix Egg" = "phoenix egg"
+local function NormName(Text)
+	return (tostring(Text):lower():gsub("[^%w]", ""))
+end
+
+-- Nama tampilan telur memakai fungsi game sendiri (EggRewards.EggDisplayName)
+local function EggTemplateName(Raw)
+	local Name = Raw:gsub("^%d+:%s*", "")
+	if EggRewardsModule and type(EggRewardsModule.EggDisplayName) == "function" then
+		local ok, Result = pcall(EggRewardsModule.EggDisplayName, Name)
+		if ok and type(Result) == "string" and Result ~= "" then
+			return Result
 		end
 	end
+	return Name
+end
+
+-- Semua jenis telur di game: template di ReplicatedStorage.Eggs (semua zona,
+-- termasuk zona yang belum termuat) + telur yang sedang ada di map
+local function AllEggNames()
+	local Seen, List = {}, {}
+	local function Add(Name)
+		local Key = NormName(Name)
+		if Key ~= "" and not Seen[Key] then
+			Seen[Key] = true
+			table.insert(List, Name)
+		end
+	end
+
+	local EggsFolder = ReplicatedStorage:FindFirstChild("Eggs")
+	if EggsFolder then
+		for _, Item in ipairs(EggsFolder:GetDescendants()) do
+			if Item:IsA("Model") and Item.Name:lower():find("egg") and not (Item.Parent and Item.Parent:IsA("Model")) then
+				Add(EggTemplateName(Item.Name))
+			end
+		end
+	end
+	for _, Egg in ipairs(CollectEggs()) do
+		Add(Egg.Name)
+	end
+
 	table.sort(List)
 	return List
 end
@@ -3386,6 +3420,7 @@ local function BestZoneIndex()
 end
 
 local TooStrong = {} -- nama telur -> os.clock() sampai kapan dilewati
+local FarmNameKeys = {} -- kunci NormName dari Farm.Names (diisi saat dropdown berubah)
 local CurrentBestIndex = nil
 local LastPickStats = "" -- alasan kalau tidak ada telur cocok (untuk status & log)
 
@@ -3401,7 +3436,7 @@ local function FarmFilter(Egg)
 	if TooStrong[Egg.Name] and os.clock() < TooStrong[Egg.Name] then
 		return false
 	end
-	if #Farm.Names > 0 and not table.find(Farm.Names, Egg.Name) then
+	if #Farm.Names > 0 and not FarmNameKeys[NormName(Egg.Name)] then
 		return false
 	end
 	if #Farm.Rarities > 0 and not table.find(Farm.Rarities, Egg.Rarity) then
@@ -3537,6 +3572,10 @@ local FarmNameDropdown = FarmSection:AddDropdown({
 	Default = {},
 	Callback = function(Value)
 		Farm.Names = Value or {}
+		table.clear(FarmNameKeys)
+		for _, Name in ipairs(Farm.Names) do
+			FarmNameKeys[NormName(Name)] = true
+		end
 	end,
 })
 
@@ -4740,12 +4779,31 @@ local function StreamZone(Index)
 	end
 end
 
--- Zona terbaik belum terlihat telurnya: muat dulu, kalau perlu datangi.
--- Tetap kosong -> tandai kosong 90 detik, farm turun ke zona di bawahnya.
+-- Zona tujuan farm: zona pilihan (filter Zones, yang tertinggi dulu) atau zona terbaik otomatis
+local function TargetZoneIndex()
+	if #Farm.Zones > 0 then
+		local Best = nil
+		for _, ZoneId in ipairs(GetZoneList()) do
+			local Index = ZoneIndex(ZoneId)
+			local Empty = ZoneEmptyUntil[Index] and os.clock() < ZoneEmptyUntil[Index]
+			if table.find(Farm.Zones, ZoneName(ZoneId)) and not Empty and (not Best or Index > Best) then
+				Best = Index
+			end
+		end
+		return Best
+	end
+	if Farm.AutoBestZone then
+		return BestZoneIndex()
+	end
+	return nil
+end
+
+-- Telur zona tujuan belum terlihat (streaming): muat dulu, kalau perlu datangi.
+-- Tetap kosong -> tandai kosong 90 detik (pindah ke zona pilihan/zona bawah lainnya).
 EnsureBestZoneLoaded = function()
 	CurrentBestIndex = BestZoneIndex()
-	local Index = CurrentBestIndex
-	if CountEggsInZone(Index) > 0 then
+	local Index = TargetZoneIndex()
+	if not Index or CountEggsInZone(Index) > 0 then
 		return
 	end
 
@@ -4766,10 +4824,12 @@ EnsureBestZoneLoaded = function()
 			FarmLog(Label .. " termuat setelah didatangi")
 			return
 		end
+	else
+		FarmLog("Gagal menuju " .. Label .. " (" .. tostring(LastMoveProblem or "?") .. ")")
 	end
 
 	ZoneEmptyUntil[Index] = os.clock() + 90
-	FarmLog(Label .. " tidak ada telur yang cocok, turun ke zona bawahnya selama 90 dtk")
+	FarmLog(Label .. " tidak ada telur yang cocok (" .. LastPickStats .. "), dilewati 90 dtk")
 	CurrentBestIndex = BestZoneIndex()
 end
 
@@ -4810,7 +4870,7 @@ local function FarmStep()
 		return
 	end
 
-	if Farm.AutoBestZone and #Farm.Zones == 0 then
+	if Farm.AutoBestZone or #Farm.Zones > 0 then
 		EnsureBestZoneLoaded()
 	end
 
@@ -4997,7 +5057,7 @@ local function DiagnoseText()
 end
 
 LogDiagnostics = function()
-	FarmLog("=== MULAI === " .. DiagnoseText())
+	FarmLog("=== MULAI === versi " .. tostring(RAPHUB_BUILD or "dev") .. " | " .. DiagnoseText())
 	FarmLog(string.format(
 		"Setelan: mode gerak %s | cara pukul %s | setor %s | zona %s | auto zona terbaik %s (%s) | speed %s",
 		Settings.TeleportMode,
