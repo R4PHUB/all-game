@@ -1,6 +1,6 @@
--- RapHub | break-steal-egg.lua | build 2026-11-25 11:17 WIB
+-- RapHub | break-steal-egg.lua | build 2026-11-25 11:33 WIB
 
-local RAPHUB_BUILD = "2026-11-25 11:17 WIB"
+local RAPHUB_BUILD = "2026-11-25 11:33 WIB"
 local Library = (function()
 local Players = game:GetService("Players")
 local Player = Players.LocalPlayer
@@ -2426,7 +2426,8 @@ local Player = Players.LocalPlayer
 local Settings = {
 	TeleportMode = "Instant (Lynx)", -- "Instant (Lynx)" | "Jalan (Aman)"
 	StepSize = 28, -- stud per frame untuk lompat jarak dekat (Lynx ~28)
-	ShortRange = 150, -- di atas jarak ini pakai respawn teleport
+	ShortRange = 250, -- di atas jarak ini pakai respawn teleport (Lynx lompat ~250 stud)
+	NoFling = true, -- tidak terpental saat ditangkap guard
 	WalkMultiplier = 1, -- pengali WalkSpeed untuk mode Jalan (Aman)
 	TweenSpeed = 300, -- stud per detik
 	ZoneTarget = "Pintu Masuk", -- "Pintu Masuk" | "Tengah Zona" | "Area Telur"
@@ -2658,18 +2659,67 @@ end
 	sampai "release" (~3 detik). Selama itu anti-cheat tidak memeriksa posisi,
 	jadi teleport jarak berapa pun aman (cara yang dipakai Lynx).
 ]]
-local Fling = { Until = 0, Count = 0 }
+local Fling = { Until = 0, Count = 0, Active = false, Hold = nil }
 do
 	local CatchFling = ReplicatedStorage:FindFirstChild("CatchFlingRemote")
 	if CatchFling then
 		CatchFling.OnClientEvent:Connect(function(Kind, _, Duration)
 			if Kind == "fling" then
 				Fling.Count += 1
+				Fling.Active = true
+				Fling.Hold = nil
 				Fling.Until = os.clock() + math.max((tonumber(Duration) or 3) - 0.4, 0.5)
 			elseif Kind == "release" then
 				Fling.Until = 0
+				Fling.Active = false
+				Fling.Hold = nil
 			end
 		end)
+	end
+end
+
+--[[
+	Anti terpental: saat ditangkap guard, game memasang VectorForce ke seluruh badan
+	(itu yang melempar karakter). Selama farm aktif, gaya itu dihapus dan posisi
+	ditahan di titik teleport terakhir -> karakter cukup "pindah", tidak terlempar.
+]]
+local function WatchFlingForces(Character)
+	Character.DescendantAdded:Connect(function(D)
+		if Fling.Active and Settings.NoFling and Working() and (D:IsA("VectorForce") or D:IsA("BodyVelocity") or D:IsA("BodyForce")) then
+			task.defer(function()
+				pcall(function()
+					D:Destroy()
+				end)
+			end)
+		end
+	end)
+end
+if Player.Character then
+	WatchFlingForces(Player.Character)
+end
+Player.CharacterAdded:Connect(WatchFlingForces)
+
+RunService.Heartbeat:Connect(function()
+	if not Fling.Active or not Settings.NoFling or not Working() then
+		return
+	end
+	local Root = GetRoot()
+	if Root then
+		Root.AssemblyLinearVelocity = Vector3.zero
+		Root.AssemblyAngularVelocity = Vector3.zero
+		if Fling.Hold then
+			Root.CFrame = Fling.Hold
+		end
+	end
+end)
+
+-- Teleport selama fling window (tanpa batas jarak) + tahan posisi di sana
+local function FlingTeleport(TargetCFrame)
+	local Root = GetRoot()
+	if Root and TargetCFrame then
+		Fling.Hold = TargetCFrame
+		Root.CFrame = TargetCFrame
+		Root.AssemblyLinearVelocity = Vector3.zero
 	end
 end
 
@@ -2811,8 +2861,7 @@ local function TeleportTo(TargetCFrame)
 
 	-- Sedang terpental guard: teleport langsung tanpa batas jarak
 	if InFlingWindow() then
-		Root.CFrame = TargetCFrame
-		Root.AssemblyLinearVelocity = Vector3.zero
+		FlingTeleport(TargetCFrame)
 		return true
 	end
 
@@ -3456,6 +3505,7 @@ end
 
 local TooStrong = {} -- nama telur -> os.clock() sampai kapan dilewati
 local FarmNameKeys = {} -- kunci NormName dari Farm.Names (diisi saat dropdown berubah)
+local MyDps = nil -- damage per detik terukur dari pukulan sendiri
 local CurrentBestIndex = nil
 local LastPickStats = "" -- alasan kalau tidak ada telur cocok (untuk status & log)
 
@@ -3469,6 +3519,10 @@ local function FarmFilter(Egg)
 		return false
 	end
 	if TooStrong[Egg.Name] and os.clock() < TooStrong[Egg.Name] then
+		return false
+	end
+	-- Sudah tahu damage sendiri: lewati telur yang HP-nya tidak bisa habis dalam batas waktu
+	if MyDps and MyDps > 0 and Egg.Health ~= math.huge and Egg.Health / MyDps > Farm.MaxTimePerEgg then
 		return false
 	end
 	if #Farm.Names > 0 and not FarmNameKeys[NormName(Egg.Name)] then
@@ -4159,6 +4213,15 @@ TpSection:AddSlider({
 	end,
 })
 
+TpSection:AddToggle({
+	Title = "Anti Terpental",
+	Content = "Saat ditangkap guard: tidak terlempar, cukup teleport ke SafeZone",
+	Default = true,
+	Callback = function(Value)
+		Settings.NoFling = Value
+	end,
+})
+
 TpSection:AddSlider({
 	Title = "Pengali Kecepatan Jalan",
 	Content = "x WalkSpeed (dibagi 10). 10 = normal, makin besar makin berisiko",
@@ -4359,8 +4422,9 @@ local function BankViaGuard()
 		end
 		Expected = nil
 		local Flat = Vector3.new(GuardPos.X - R.Position.X, 0, GuardPos.Z - R.Position.Z)
-		if Flat.Magnitude > 2 then
-			local Next = R.Position + Flat.Unit * math.min(Flat.Magnitude - 1, Settings.StepSize)
+		-- Berhenti ~8 stud dari guard (tidak masuk ke badannya), guard yang datang menangkap
+		if Flat.Magnitude > 8 then
+			local Next = R.Position + Flat.Unit * math.min(Flat.Magnitude - 8, Settings.StepSize)
 			local Ground = GroundAt(Next.X, Next.Z, R.Position.Y + 6)
 			local NewPos = Vector3.new(Next.X, Ground.Y + Hum.HipHeight + R.Size.Y / 2, Next.Z)
 			R.CFrame = CFrame.lookAt(NewPos, NewPos + Flat.Unit)
@@ -4387,13 +4451,9 @@ local function BankViaGuard()
 	-- 3. Teleport ke SafeZone selama fling window -> hewan tersimpan
 	if CarryCount() > 0 and InFlingWindow() then
 		SetStatus("Teleport ke SafeZone...")
-		local R = GetRoot()
-		if R then
-			R.CFrame = Spot
-			R.AssemblyLinearVelocity = Vector3.zero
-		end
+		FlingTeleport(Spot)
 		local BankStart = os.clock()
-		while CarryCount() > 0 and os.clock() - BankStart < 1.2 do
+		while CarryCount() > 0 and os.clock() - BankStart < 2 do
 			task.wait(0.05)
 		end
 		FarmLog(CarryCount() == 0 and "Setor berhasil di SafeZone" or "Setor gagal: hewan masih dibawa setelah di SafeZone")
@@ -4738,8 +4798,7 @@ ChainInFling = function(Spot, ReturnTo)
 			break
 		end
 
-		Root.CFrame = StandAt(Anchor.Position)
-		Root.AssemblyLinearVelocity = Vector3.zero
+		FlingTeleport(StandAt(Anchor.Position))
 		local Before, Started, Attempt = CarryCount(), os.clock(), 0
 		while CarryCount() <= Before and os.clock() - Started < 0.8 and InFlingWindow() and Target.Prompt.Parent do
 			Attempt += 1
@@ -4756,20 +4815,12 @@ ChainInFling = function(Spot, ReturnTo)
 			break -- dibawa, nanti disetor di langkah berikutnya
 		end
 
-		Root = GetRoot()
-		if Root then
-			Root.CFrame = Spot
-			Root.AssemblyLinearVelocity = Vector3.zero
-		end
+		FlingTeleport(Spot)
 		local BankStart = os.clock()
 		while CarryCount() > 0 and os.clock() - BankStart < 1 do
 			task.wait(0.05)
 		end
-		Root = GetRoot()
-		if Root then
-			Root.CFrame = ReturnTo
-			Root.AssemblyLinearVelocity = Vector3.zero
-		end
+		FlingTeleport(ReturnTo)
 	end
 	if Count > 0 then
 		FarmLog(string.format("Rantai fling window: %d hewan", Count))
@@ -4919,10 +4970,10 @@ local EnsureBestZoneLoaded -- didefinisikan di bawah
 local LogDiagnostics -- diisi setelah DiagnoseText ada
 
 -- Jumlah telur lolos filter di satu zona (yang sudah termuat di client)
-local function CountEggsInZone(Index)
+local function CountEggsInZone(Index, IgnoreFilter)
 	local Count = 0
 	for _, Egg in ipairs(CollectEggs()) do
-		if ZoneIndex(Egg.ZoneId) == Index and FarmFilter(Egg) then
+		if ZoneIndex(Egg.ZoneId) == Index and (IgnoreFilter or FarmFilter(Egg)) then
 			Count += 1
 		end
 	end
@@ -4983,6 +5034,18 @@ EnsureBestZoneLoaded = function()
 		return
 	end
 
+	-- Telur zona ini terlihat tapi tidak ada yang lolos (terlalu kuat / filter): tidak perlu didatangi
+	if CountEggsInZone(Index, true) > 0 then
+		ZoneEmptyUntil[Index] = os.clock() + 90
+		FarmLog(string.format(
+			"%s: telur ada tapi terlalu kuat/tidak lolos filter (damage kamu %s/dtk), dilewati 90 dtk",
+			Label,
+			MyDps and string.format("%.3g", MyDps) or "belum diukur"
+		))
+		CurrentBestIndex = BestZoneIndex()
+		return
+	end
+
 	SetStatus("Menuju " .. Label .. " (telur belum termuat)")
 	local Target = ZoneTargetCFrame("Zone" .. Index)
 	if Target and TeleportTo(Target) then
@@ -5024,6 +5087,18 @@ task.spawn(function()
 end)
 
 local function FarmStep()
+	-- Masih dipegang guard: tunggu "release" dulu (kalau mencuri sekarang, hewan langsung direbut)
+	if Fling.Active then
+		SetStatus("Menunggu guard melepas...")
+		local Started = os.clock()
+		while Fling.Active and os.clock() - Started < 5 do
+			task.wait(0.1)
+		end
+		Fling.Active = false
+		Fling.Hold = nil
+		return
+	end
+
 	if IsJailed() then
 		SetStatus("Sedang ditahan, menunggu...")
 		task.wait(1)
@@ -5158,6 +5233,7 @@ local function FarmStep()
 
 			NoDamageStreak = 0
 			local Rate = (StartHP - NowHP) / Elapsed
+			MyDps = math.max(MyDps or 0, Rate)
 			local Eta = NowHP / Rate
 			FarmLog(string.format("%s: HP turun %.3g/dtk, pecah sekitar %.0f dtk lagi | cara: %s", Label, Rate, Eta, MethodText))
 			if Eta > Farm.MaxTimePerEgg then
@@ -5291,6 +5367,7 @@ local function DiagnoseText()
 	table.insert(Parts, string.format("Rarity: %d dari %s", #RARITY_ORDER, table.concat(DataSource.Rarities, "+")))
 	GetAnimalRarity()
 	table.insert(Parts, "Hewan dikenal: " .. AnimalRarityCount)
+	table.insert(Parts, "Damage terukur: " .. (MyDps and string.format("%.3g/dtk", MyDps) or "belum"))
 	Check("Modul ZonesConfig", ZonesConfig ~= nil)
 	Check("Modul EggRewards", EggRewardsModule ~= nil)
 	return table.concat(Parts, " | ")
