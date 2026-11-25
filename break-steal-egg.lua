@@ -1,6 +1,6 @@
--- RapHub | break-steal-egg.lua | build 2026-11-25 12:20 WIB
+-- RapHub | break-steal-egg.lua | build 2026-11-25 12:22 WIB
 
-local RAPHUB_BUILD = "2026-11-25 12:20 WIB"
+local RAPHUB_BUILD = "2026-11-25 12:22 WIB"
 local Library = (function()
 --[[
 	RapHub UI v2 — template panel untuk semua game RapHub
@@ -36,6 +36,7 @@ local Player = Players.LocalPlayer
 
 local Library = {
 	Unloaded = false,
+	LogoStatus = "belum",
 	Flags = {},
 	Setters = {},
 	ConfigFolder = "RapHub/Configs",
@@ -804,21 +805,94 @@ function Library:CreateWindow(Config)
 		Update()
 	end
 	ApplyLogo(Config.Logo)
-	if Config.LogoUrl and getcustomasset and writefile then
-		task.spawn(function()
-			local ok, Data = pcall(function()
-				return game:HttpGet(Config.LogoUrl)
-			end)
-			if ok and type(Data) == "string" and #Data > 100 then
-				EnsureFolder("RapHub")
-				pcall(writefile, "RapHub/logo.png", Data)
-				local ok2, Asset = pcall(getcustomasset, "RapHub/logo.png")
-				if ok2 and Asset then
-					ApplyLogo(Asset)
+
+	--[[
+		Cadangan logo yang andal: gambar logo diunduh lalu ditampilkan lewat getcustomasset.
+		Tidak bergantung izin aset Roblox di game orang lain. Sumber gambar:
+		Config.LogoUrl, atau otomatis dari API thumbnail Roblox untuk asset ID di Config.Logo.
+		File disimpan di RapHub/logo_<id>.png (cache, cukup diunduh sekali).
+	]]
+	local function HttpGet(Url)
+		local ok, Body = pcall(function()
+			return game:HttpGet(Url)
+		end)
+		if ok and type(Body) == "string" then
+			return Body
+		end
+		if request then
+			local ok2, Response = pcall(request, { Url = Url, Method = "GET" })
+			if ok2 and type(Response) == "table" and type(Response.Body) == "string" then
+				return Response.Body
+			end
+		end
+		return nil
+	end
+
+	local function LoadCustomLogo()
+		if not (getcustomasset and writefile) then
+			Library.LogoStatus = "executor tidak punya getcustomasset/writefile"
+			return false
+		end
+		local AssetId = tostring(Config.Logo or ""):match("%d+")
+		local Path = "RapHub/logo_" .. (AssetId or "custom") .. ".png"
+
+		local Cached = false
+		pcall(function()
+			Cached = isfile and isfile(Path) or false
+		end)
+
+		if not Cached then
+			local Url = Config.LogoUrl
+			if not Url and AssetId then
+				local Json = HttpGet(
+					"https://thumbnails.roblox.com/v1/assets?assetIds="
+						.. AssetId
+						.. "&size=420x420&format=Png&isCircular=false"
+				)
+				local ok, Data = pcall(function()
+					return HttpService:JSONDecode(Json)
+				end)
+				local Entry = ok and type(Data) == "table" and Data.data and Data.data[1]
+				-- Gambar private/ditolak hanya memberi placeholder: jangan dipakai
+				if Entry and Entry.state == "Completed" and tostring(Entry.imageUrl):find("/Image/") then
+					Url = Entry.imageUrl
 				end
 			end
-		end)
+			if not Url then
+				Library.LogoStatus = "thumbnail logo tidak tersedia (masih private/ditolak?)"
+				return false
+			end
+			local Png = HttpGet(Url)
+			if not Png or #Png < 200 or Png:sub(2, 4) ~= "PNG" then
+				Library.LogoStatus = "gagal unduh gambar logo"
+				return false
+			end
+			EnsureFolder("RapHub")
+			if not pcall(writefile, Path, Png) then
+				Library.LogoStatus = "gagal menyimpan file logo"
+				return false
+			end
+		end
+
+		local ok, Asset = pcall(getcustomasset, Path)
+		if ok and Asset then
+			ApplyLogo(Asset)
+			Library.LogoStatus = "OK (file " .. Path .. ")"
+			return true
+		end
+		Library.LogoStatus = "getcustomasset gagal: " .. tostring(Asset)
+		return false
 	end
+
+	task.spawn(function()
+		-- Beri kesempatan rbxassetid termuat dulu; kalau gagal pakai logo unduhan
+		task.wait(Config.LogoUrl and 0 or 1.5)
+		if Logo.IsLoaded then
+			Library.LogoStatus = "OK (rbxassetid)"
+		else
+			LoadCustomLogo()
+		end
+	end)
 
 	local function SetMinimized(State)
 		Main.Visible = not State
@@ -4662,6 +4736,7 @@ local function DiagnoseText()
 	table.insert(Parts, "Damage terukur: " .. (MyDps and string.format("%.3g/dtk", MyDps) or "belum"))
 	Check("Modul ZonesConfig", ZonesConfig ~= nil)
 	Check("Modul EggRewards", EggRewardsModule ~= nil)
+	table.insert(Parts, "Logo: " .. tostring(Library.LogoStatus))
 	return table.concat(Parts, " | ")
 end
 
