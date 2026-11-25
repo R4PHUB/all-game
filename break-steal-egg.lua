@@ -1,6 +1,6 @@
--- RapHub | break-steal-egg.lua | build 2026-11-25 12:22 WIB
+-- RapHub | break-steal-egg.lua | build 2026-11-25 12:30 WIB
 
-local RAPHUB_BUILD = "2026-11-25 12:22 WIB"
+local RAPHUB_BUILD = "2026-11-25 12:30 WIB"
 local Library = (function()
 --[[
 	RapHub UI v2 — template panel untuk semua game RapHub
@@ -492,10 +492,10 @@ function Library:CreateWindow(Config)
 		BackgroundTransparency = 1,
 		AutomaticSize = Enum.AutomaticSize.X,
 		Size = UDim2.new(0, 0, 1, 0),
-		Font = Enum.Font.GothamBlack,
+		Font = Enum.Font.GothamBold,
 		Text = Config.Title or "RapHub",
 		TextColor3 = Theme.Accent,
-		TextSize = 16,
+		TextSize = 15,
 		LayoutOrder = 2,
 	}, Left)
 	Create("Frame", {
@@ -531,23 +531,63 @@ function Library:CreateWindow(Config)
 	}, Right)
 
 	if Config.Discord then
-		Create("ImageLabel", {
+		-- Link Discord: klik = salin link ke clipboard + notifikasi
+		local DiscordText = tostring(Config.Discord):gsub("^https?://", "")
+		local DiscordLink = "https://" .. DiscordText
+
+		local DiscordButton = Create("TextButton", {
+			BackgroundTransparency = 1,
+			AutomaticSize = Enum.AutomaticSize.X,
+			Size = UDim2.new(0, 0, 1, 0),
+			Text = "",
+			AutoButtonColor = false,
+			LayoutOrder = 1,
+		}, Right)
+		Create("UIListLayout", {
+			FillDirection = Enum.FillDirection.Horizontal,
+			VerticalAlignment = Enum.VerticalAlignment.Center,
+			Padding = UDim.new(0, 6),
+			SortOrder = Enum.SortOrder.LayoutOrder,
+		}, DiscordButton)
+		local DiscordIcon = Create("ImageLabel", {
 			BackgroundTransparency = 1,
 			Size = UDim2.fromOffset(14, 14),
 			Image = Icon("message"),
 			ImageColor3 = Theme.Accent,
 			LayoutOrder = 1,
-		}, Right)
-		Create("TextLabel", {
+		}, DiscordButton)
+		local DiscordLabel = Create("TextLabel", {
 			BackgroundTransparency = 1,
 			AutomaticSize = Enum.AutomaticSize.X,
 			Size = UDim2.new(0, 0, 1, 0),
 			Font = Enum.Font.GothamBold,
-			Text = Config.Discord,
+			Text = DiscordText,
 			TextColor3 = Theme.Accent,
 			TextSize = 12,
 			LayoutOrder = 2,
-		}, Right)
+		}, DiscordButton)
+
+		Connect(DiscordButton.MouseEnter, function()
+			Tween(DiscordLabel, 0.15, { TextColor3 = Theme.Text })
+			Tween(DiscordIcon, 0.15, { ImageColor3 = Theme.Text })
+		end)
+		Connect(DiscordButton.MouseLeave, function()
+			Tween(DiscordLabel, 0.15, { TextColor3 = Theme.Accent })
+			Tween(DiscordIcon, 0.15, { ImageColor3 = Theme.Accent })
+		end)
+		Connect(DiscordButton.MouseButton1Click, function()
+			local Copied = false
+			local Clipboard = setclipboard or toclipboard
+			if type(Clipboard) == "function" then
+				Copied = pcall(Clipboard, DiscordLink)
+			end
+			Library:Notify({
+				Title = "Discord",
+				Content = Copied and ("Link Discord disalin: " .. DiscordLink) or ("Salin manual: " .. DiscordLink),
+				Duration = 3,
+			})
+		end)
+
 		Create("Frame", {
 			BackgroundColor3 = Color3.new(1, 1, 1),
 			BackgroundTransparency = 0.85,
@@ -779,19 +819,28 @@ function Library:CreateWindow(Config)
 	end
 
 	-- Logo: rbxassetid atau URL (getcustomasset). Huruf cadangan disembunyikan saat gambar termuat.
-	local function ApplyLogo(Image)
+	-- Logo dianggap siap kalau salah satu gambar termuat atau logo unduhan berhasil dipasang.
+	-- (Tombol bulat tersembunyi tidak pernah \"termuat\", jadi hurufnya ikut status ini.)
+	local LogoReady = false
+	local function ApplyLogo(Image, Ready)
 		if not Image or Image == "" then
 			return
 		end
 		Logo.Image = Image
 		OpenButton.Image = Image
+		if Ready then
+			LogoReady = true
+		end
 		local function Update()
-			LogoLetter.Visible = not Logo.IsLoaded
-			OpenLetter.Visible = not OpenButton.IsLoaded
+			if Logo.IsLoaded or OpenButton.IsLoaded then
+				LogoReady = true
+			end
+			LogoLetter.Visible = not LogoReady
+			OpenLetter.Visible = not LogoReady
 			-- Logo sudah berbentuk bulat sendiri: latar & garis tebal tidak diperlukan
-			Logo.BackgroundTransparency = Logo.IsLoaded and 1 or 0
-			OpenButton.BackgroundTransparency = OpenButton.IsLoaded and 1 or 0
-			OpenStroke.Transparency = OpenButton.IsLoaded and 0.6 or 0.2
+			Logo.BackgroundTransparency = LogoReady and 1 or 0
+			OpenButton.BackgroundTransparency = LogoReady and 1 or 0
+			OpenStroke.Transparency = LogoReady and 0.6 or 0.2
 		end
 		Connect(Logo:GetPropertyChangedSignal("IsLoaded"), Update)
 		Connect(OpenButton:GetPropertyChangedSignal("IsLoaded"), Update)
@@ -876,7 +925,7 @@ function Library:CreateWindow(Config)
 
 		local ok, Asset = pcall(getcustomasset, Path)
 		if ok and Asset then
-			ApplyLogo(Asset)
+			ApplyLogo(Asset, true)
 			Library.LogoStatus = "OK (file " .. Path .. ")"
 			return true
 		end
@@ -2932,6 +2981,7 @@ local Window = Library:CreateWindow({
 	Title = "RapHub",
 	SubTitle = "Break and Steal an Egg",
 	Logo = "rbxassetid://139538771251251",
+	Discord = "discord.gg/9CfpYFARsb",
 	Size = UDim2.fromOffset(660, 440),
 	ConfigFolder = "RapHub/Configs/BreakStealEgg",
 })
