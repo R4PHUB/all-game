@@ -1,6 +1,6 @@
--- RapHub | break-steal-egg.lua | build 2026-11-25 11:00 WIB
+-- RapHub | break-steal-egg.lua | build 2026-11-25 11:11 WIB
 
-local RAPHUB_BUILD = "2026-11-25 11:00 WIB"
+local RAPHUB_BUILD = "2026-11-25 11:11 WIB"
 local Library = (function()
 local Players = game:GetService("Players")
 local Player = Players.LocalPlayer
@@ -2446,6 +2446,9 @@ local Farm = {
 	ReturnWhenFull = true, -- setor hewan saat satchel penuh
 	BankMode = "Lewat Guard (Cepat)", -- "Lewat Guard (Cepat)" | "Jalan ke Base"
 	AutoBestZone = true, -- tanpa filter Zones: farm di zona tertinggi sesuai Speed
+	PickAnimals = true, -- ambil hewan yang muncul (termasuk dari telur pecahan pemain lain)
+	AnimalRarities = {}, -- kosong = semua
+	AnimalMinWeight = 0, -- kg
 }
 
 local Steal = {
@@ -2985,43 +2988,75 @@ local function NormName(Text)
 	return (tostring(Text):lower():gsub("[^%w]", ""))
 end
 
--- Nama tampilan telur memakai fungsi game sendiri (EggRewards.EggDisplayName)
-local function EggTemplateName(Raw)
-	local Name = Raw:gsub("^%d+:%s*", "")
-	if EggRewardsModule and type(EggRewardsModule.EggDisplayName) == "function" then
-		local ok, Result = pcall(EggRewardsModule.EggDisplayName, Name)
-		if ok and type(Result) == "string" and Result ~= "" then
-			return Result
-		end
+-- Jenis telur DIPELAJARI dari telur yang benar-benar muncul di tiap zona
+-- (semua zona dipindai saat load, hasil disimpan ke RapHub/EggTypes.txt)
+local EggTypes = {} -- NormName -> { Name, ZoneId }
+local EGG_TYPES_FILE = "RapHub/EggTypes.txt"
+
+local function LearnEggType(Name, ZoneId)
+	if type(Name) ~= "string" or type(ZoneId) ~= "string" or not ZoneId:match("^Zone%d+$") then
+		return false
 	end
-	return Name
+	local Key = NormName(Name)
+	if Key == "" or EggTypes[Key] then
+		return false
+	end
+	EggTypes[Key] = { Name = Name, ZoneId = ZoneId }
+	return true
 end
 
--- Semua jenis telur di game: template di ReplicatedStorage.Eggs (semua zona,
--- termasuk zona yang belum termuat) + telur yang sedang ada di map
-local function AllEggNames()
-	local Seen, List = {}, {}
-	local function Add(Name)
-		local Key = NormName(Name)
-		if Key ~= "" and not Seen[Key] then
-			Seen[Key] = true
-			table.insert(List, Name)
-		end
-	end
-
-	local EggsFolder = ReplicatedStorage:FindFirstChild("Eggs")
-	if EggsFolder then
-		for _, Item in ipairs(EggsFolder:GetDescendants()) do
-			if Item:IsA("Model") and Item.Name:lower():find("egg") and not (Item.Parent and Item.Parent:IsA("Model")) then
-				Add(EggTemplateName(Item.Name))
+pcall(function()
+	if isfile and readfile and isfile(EGG_TYPES_FILE) then
+		for Line in readfile(EGG_TYPES_FILE):gmatch("[^\n]+") do
+			local ZoneId, Name = Line:match("^(Zone%d+)|(.+)$")
+			if ZoneId then
+				LearnEggType(Name, ZoneId)
 			end
 		end
 	end
-	for _, Egg in ipairs(CollectEggs()) do
-		Add(Egg.Name)
-	end
+end)
 
-	table.sort(List)
+local function SaveEggTypes()
+	if not writefile then
+		return
+	end
+	local Lines = {}
+	for _, Info in pairs(EggTypes) do
+		table.insert(Lines, Info.ZoneId .. "|" .. Info.Name)
+	end
+	table.sort(Lines)
+	pcall(function()
+		if makefolder and not (isfolder and isfolder("RapHub")) then
+			makefolder("RapHub")
+		end
+		writefile(EGG_TYPES_FILE, table.concat(Lines, "\n"))
+	end)
+end
+
+-- Label dropdown "Treasure Egg - Pirate Cove" -> nama telur
+local function EggLabelName(Label)
+	return tostring(Label):match("^(.-) %- ") or tostring(Label)
+end
+
+-- Daftar Egg Types: urut zona lalu nama, label "Nama - Zona"
+local function AllEggNames()
+	for _, Egg in ipairs(CollectEggs()) do
+		LearnEggType(Egg.Name, Egg.ZoneId)
+	end
+	local Items = {}
+	for _, Info in pairs(EggTypes) do
+		table.insert(Items, Info)
+	end
+	table.sort(Items, function(x, y)
+		if ZoneIndex(x.ZoneId) ~= ZoneIndex(y.ZoneId) then
+			return ZoneIndex(x.ZoneId) < ZoneIndex(y.ZoneId)
+		end
+		return x.Name < y.Name
+	end)
+	local List = {}
+	for _, Info in ipairs(Items) do
+		table.insert(List, Info.Name .. " - " .. ZoneName(Info.ZoneId))
+	end
 	return List
 end
 
@@ -3574,7 +3609,7 @@ local FarmNameDropdown = FarmSection:AddDropdown({
 		Farm.Names = Value or {}
 		table.clear(FarmNameKeys)
 		for _, Name in ipairs(Farm.Names) do
-			FarmNameKeys[NormName(Name)] = true
+			FarmNameKeys[NormName(EggLabelName(Name))] = true
 		end
 	end,
 })
@@ -3596,6 +3631,35 @@ FarmSection:AddInput({
 	Default = "0",
 	Callback = function(Value)
 		Farm.MinWeight = tonumber(Value) or 0
+	end,
+})
+
+FarmSection:AddToggle({
+	Title = "Ambil Hewan yang Muncul",
+	Content = "Hewan dari telur yang pecah (termasuk pecahan pemain lain) langsung diambil & diamankan",
+	Default = true,
+	Callback = function(Value)
+		Farm.PickAnimals = Value
+	end,
+})
+
+FarmSection:AddDropdown({
+	Title = "Animal Rarities (kosong = semua)",
+	Content = "Rarity hewan yang diambil",
+	Multi = true,
+	Options = table.clone(RARITY_ORDER),
+	Default = {},
+	Callback = function(Value)
+		Farm.AnimalRarities = Value or {}
+	end,
+})
+
+FarmSection:AddInput({
+	Title = "Min Berat Hewan (kg)",
+	Content = "Lewati hewan yang lebih ringan",
+	Default = "0",
+	Callback = function(Value)
+		Farm.AnimalMinWeight = tonumber(Value) or 0
 	end,
 })
 
@@ -4521,15 +4585,16 @@ local function AllStealPrompts()
 	return List
 end
 
-local function StealFilter(Info)
-	if #Steal.Rarities > 0 and not table.find(Steal.Rarities, Info.Rarity) then
+local function StealFilter(Info, Cfg)
+	Cfg = Cfg or Steal
+	if #Cfg.Rarities > 0 and not table.find(Cfg.Rarities, Info.Rarity) then
 		return false
 	end
 	local Weight = tonumber(Info.WeightKg)
-	if Steal.MinWeight > 0 and Weight and Weight < Steal.MinWeight then
+	if Cfg.MinWeight > 0 and Weight and Weight < Cfg.MinWeight then
 		return false
 	end
-	if Steal.MutationOnly and (Info.Mutation == nil or Info.Mutation == "") then
+	if Cfg.MutationOnly and (Info.Mutation == nil or Info.Mutation == "") then
 		return false
 	end
 	return true
@@ -4576,7 +4641,8 @@ local function PlotAt(Pos)
 	return nil
 end
 
-local function StealTargets()
+local function StealTargets(Cfg)
+	Cfg = Cfg or Steal
 	local List = {}
 	local Root = GetRoot()
 	local Plot = MyPlot()
@@ -4588,15 +4654,15 @@ local function StealTargets()
 		local Mine = Plot ~= nil and (PlotHere == Plot or Prompt:IsDescendantOf(Plot))
 		if Pos and Prompt:IsDescendantOf(workspace) and not StealSkip[Prompt] and not Mine then
 			local InBase = PlotHere ~= nil or (Plots ~= nil and Prompt:IsDescendantOf(Plots))
-			if (InBase and Steal.OtherBases) or (not InBase and Steal.Dropped) then
+			if (InBase and Cfg.OtherBases) or (not InBase and Cfg.Dropped) then
 				local ZoneOk = true
-				if Pos and #Steal.Zones > 0 then
+				if Pos and #Cfg.Zones > 0 then
 					local ZoneId = ZoneIdAt(Pos)
-					ZoneOk = ZoneId ~= nil and table.find(Steal.Zones, ZoneName(ZoneId)) ~= nil
+					ZoneOk = ZoneId ~= nil and table.find(Cfg.Zones, ZoneName(ZoneId)) ~= nil
 				end
 				if Pos and ZoneOk then
 					local Info = PromptInfo(Prompt)
-					if StealFilter(Info) then
+					if StealFilter(Info, Cfg) then
 						Info.Prompt = Prompt
 						Info.Position = Pos
 						Info.InBase = InBase
@@ -4612,6 +4678,18 @@ local function StealTargets()
 		return a.Distance < b.Distance
 	end)
 	return List
+end
+
+-- Setelan pencarian hewan untuk Auto Farm (hewan tergeletak di zona farm, bukan base orang)
+local function FarmAnimalConfig()
+	return {
+		Dropped = true,
+		OtherBases = false,
+		Rarities = Farm.AnimalRarities,
+		MinWeight = Farm.AnimalMinWeight,
+		MutationOnly = false,
+		Zones = Farm.Zones,
+	}
 end
 
 local LastStealResult = "-"
@@ -4636,6 +4714,11 @@ local function StealOne(Info)
 	local Started, Attempt, Method = os.clock(), 0, "-"
 	while os.clock() - Started < 3 and CarryCount() <= Before and Info.Prompt.Parent and Info.Prompt.Enabled do
 		Attempt += 1
+		-- Hewan bisa berjalan: ikuti posisi prompt (jangkauan prompt ~10 stud)
+		local Root = GetRoot()
+		if Root and Anchor and Anchor:IsA("BasePart") and (Anchor.Position - Root.Position).Magnitude > 7 then
+			TeleportTo(StandAt(Anchor.Position))
+		end
 		Method = FirePrompt(Info.Prompt, Attempt)
 		task.wait(0.2)
 	end
@@ -4833,6 +4916,29 @@ EnsureBestZoneLoaded = function()
 	CurrentBestIndex = BestZoneIndex()
 end
 
+-- Saat load: pindai semua zona (streaming) untuk mempelajari jenis telur tiap zona
+task.spawn(function()
+	task.wait(3)
+	local Learned = 0
+	for _, ZoneId in ipairs(GetZoneList()) do
+		if Library.Unloaded then
+			return
+		end
+		StreamZone(ZoneIndex(ZoneId))
+		task.wait(0.3)
+		for _, Egg in ipairs(CollectEggs()) do
+			if LearnEggType(Egg.Name, Egg.ZoneId) then
+				Learned += 1
+			end
+		end
+	end
+	SaveEggTypes()
+	FarmLog(string.format("Jenis telur dipelajari: %d baru dari pemindaian zona", Learned))
+	pcall(function()
+		FarmNameDropdown:Refresh(AllEggNames(), Farm.Names)
+	end)
+end)
+
 local function FarmStep()
 	if IsJailed() then
 		SetStatus("Sedang ditahan, menunggu...")
@@ -4844,6 +4950,15 @@ local function FarmStep()
 	if Farm.ReturnWhenFull and CarryCount() >= SatchelCapacity() then
 		Bank()
 		return
+	end
+
+	-- Auto farm: hewan yang muncul & lolos filter diambil dulu (lebih cepat dari memecah telur)
+	if Farm.Enabled and Farm.PickAnimals and CarryCount() < SatchelCapacity() then
+		local Animal = StealTargets(FarmAnimalConfig())[1]
+		if Animal then
+			StealOne(Animal)
+			return
+		end
 	end
 
 	-- Auto steal dulu (hewan siap ambil lebih cepat daripada memecah telur)
@@ -4880,7 +4995,7 @@ local function FarmStep()
 			Bank()
 			return
 		end
-		SetStatus("Menunggu telur yang cocok (" .. LastPickStats .. ")")
+		SetStatus("Menunggu telur/hewan yang cocok (" .. LastPickStats .. ")")
 		table.clear(FarmSkip)
 		task.wait(1)
 		return
@@ -4910,7 +5025,8 @@ local function FarmStep()
 		end
 
 		-- Terpental (guard / dorongan) -> dekati lagi, maksimal 3x
-		if Distance(Egg) > 12 then
+		-- (ambang pakai ukuran telur: telur besar titik tengahnya memang jauh)
+		if Distance(Egg) > math.max(Egg.Size.X, Egg.Size.Z) / 2 + 8 then
 			Retries += 1
 			if Retries > 3 or not TeleportToEgg(Egg) then
 				FarmLog("Terpental terus dari " .. Label .. ", pindah telur")
@@ -4961,8 +5077,8 @@ local function FarmStep()
 			local Eta = NowHP / Rate
 			FarmLog(string.format("%s: HP turun %.3g/dtk, pecah sekitar %.0f dtk lagi | cara: %s", Label, Rate, Eta, MethodText))
 			if Eta > Farm.MaxTimePerEgg then
-				TooStrong[Egg.Name] = os.clock() + 120
-				FarmLog(Label .. " terlalu kuat untuk batas waktu, jenis ini dilewati 2 menit")
+				TooStrong[Egg.Name] = os.clock() + 600
+				FarmLog(Label .. " terlalu kuat untuk batas waktu, jenis ini dilewati 10 menit")
 				FarmSkip[Egg.Model] = true
 				break
 			end
